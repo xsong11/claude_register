@@ -35,7 +35,7 @@ class _ImpersonatingClient:
     （198.18.x.x），本地解析出的虚拟地址拿去 CONNECT 上游只会被拒。
     """
 
-    def __init__(self, proxy: str | None, *, timeout: float = 15.0):
+    def __init__(self, proxy: str | None, *, timeout: float = 15.0, allow_redirects: bool = True):
         self._relay: SocksRelay | None = None
         target = proxy
         if proxy and needs_relay(parse_proxy(proxy)):
@@ -49,7 +49,7 @@ class _ImpersonatingClient:
                 impersonate=IMPERSONATE,
                 proxy=target,
                 timeout=timeout,
-                allow_redirects=True,
+                allow_redirects=allow_redirects,
             )
         except Exception:
             self._stop_relay()

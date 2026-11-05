@@ -23,7 +23,7 @@ export function PlatformBadge({ platform }) {
     <Badge
       variant="outline"
       className={`rounded-full px-1.5 text-[11px] ${
-        p === "chatgpt" ? "border-teal-500/40 text-teal-400" : p === "both" ? "border-violet-500/40 text-violet-400" : ""
+        p === "chatgpt" ? "border-teal-500/40 text-teal-700 dark:text-teal-400" : p === "both" ? "border-violet-500/40 text-violet-700 dark:text-violet-400" : ""
       }`}
     >
       {PLATFORM_LABEL[p] || p}
@@ -31,11 +31,10 @@ export function PlatformBadge({ platform }) {
   );
 }
 
-export default function Register({ runStream }) {
-  const { activeRunId, activeStatus, logLines, attach, streamEpoch } = runStream;
+export default function Register({ runStream, platform = "claude" }) {
+  const { activeRunId, activeStatus, activePlatform, logLines, attach, streamEpoch } = runStream;
   const [proxies, setProxies] = useState([]);
   const [proxyId, setProxyId] = useState("");
-  const [platform, setPlatform] = useState("claude");
   const [groupName, setGroupName] = useState("");
   const [groups, setGroups] = useState([]);
   useEffect(() => {
@@ -75,8 +74,10 @@ export default function Register({ runStream }) {
   }, [previewOpen, previewCount]);
 
   useEffect(() => {
-    api.listRuns().then(setRuns).catch(() => {});
-  }, [streamEpoch]);
+    let current = true;
+    api.listRuns(platform).then((items) => current && setRuns(items)).catch(() => {});
+    return () => { current = false; };
+  }, [streamEpoch, platform]);
 
   useEffect(() => {
     const vp = logPanelRef.current?.closest("[data-slot='scroll-area-viewport']");
@@ -89,7 +90,7 @@ export default function Register({ runStream }) {
       const res = await api.startRun(
         email || undefined, domain || undefined, proxyId || undefined, platform, groupName.trim(),
       );
-      attach(res.run_id);
+      attach(res.run_id, platform);
     } catch (err) {
       toast.error(err.status === 409 ? "已有任务在运行" : err.body?.detail || "启动失败，请重试");
     } finally {
@@ -110,29 +111,9 @@ export default function Register({ runStream }) {
       <div className="grid items-start gap-5 min-[1200px]:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
         <Card className="min-w-0">
           <CardHeader>
-            <CardTitle>开始注册</CardTitle>
+            <CardTitle>注册 {PLATFORM_LABEL[platform]}</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="目标平台">
-              {PLATFORMS.map(([v, label]) => (
-                <Button
-                  key={v}
-                  type="button"
-                  size="sm"
-                  role="radio"
-                  aria-checked={platform === v}
-                  variant={platform === v ? "default" : "outline"}
-                  onClick={() => setPlatform(v)}
-                >
-                  {label}
-                </Button>
-              ))}
-            </div>
-            {platform === "both" && (
-              <p className="text-xs text-muted-foreground">
-                先注册 Claude，再用同一邮箱、代理与 OKBrowser 窗口注册 ChatGPT。
-              </p>
-            )}
             <Input
               placeholder="邮箱后缀 / domain（可选）"
               value={domain}
@@ -170,7 +151,10 @@ export default function Register({ runStream }) {
               {starting ? "启动中…" : "开始注册"}
             </Button>
 
-            {activeRunId && (
+            {activeStatus === "running" && activePlatform && activePlatform !== platform && (
+              <p className="text-xs text-muted-foreground">{PLATFORM_LABEL[activePlatform]} 正在注册，完成后可启动下一条任务。</p>
+            )}
+            {activeRunId && (!activePlatform || activePlatform === platform) && (
               <div className="pt-2">
                 <div className="mb-2 flex items-center justify-between text-sm text-muted-foreground">
                   <span>
@@ -178,7 +162,7 @@ export default function Register({ runStream }) {
                   </span>
                   <StatusBadge status={activeStatus} />
                 </div>
-                <ScrollArea className="log-panel h-64 rounded-lg border bg-black/40 text-muted-foreground">
+                <ScrollArea className="log-panel h-64 rounded-lg border bg-muted text-muted-foreground dark:bg-black/40">
                   <div className="p-3" ref={logPanelRef}>
                     {logLines.length === 0 ? (
                       <div className="text-muted-foreground/60">等待日志输出…</div>
@@ -238,7 +222,7 @@ export default function Register({ runStream }) {
                   </Button>
                 </div>
                 <StatusBadge status={selectedRun.status} />
-                <ScrollArea className="log-panel mt-2 rounded-lg border bg-black/40 text-muted-foreground [&>[data-slot=scroll-area-viewport]]:max-h-80">
+                <ScrollArea className="log-panel mt-2 rounded-lg border bg-muted text-muted-foreground dark:bg-black/40 [&>[data-slot=scroll-area-viewport]]:max-h-80">
                   <pre className="p-3 whitespace-pre-wrap break-all">{selectedRun.log || "（无日志）"}</pre>
                 </ScrollArea>
                 {selectedRun.screenshots && selectedRun.screenshots.length > 0 && (

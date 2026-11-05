@@ -2,13 +2,13 @@ import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
 const STATUS = {
-  pending: { label: "待注册", cls: "bg-zinc-500/15 text-zinc-400" },
-  running: { label: "运行中", cls: "bg-blue-500/15 text-blue-400" },
-  success: { label: "成功", cls: "bg-emerald-500/15 text-emerald-400" },
-  failed: { label: "失败", cls: "bg-red-500/15 text-red-400" },
-  needs_manual: { label: "需人工介入", cls: "bg-amber-500/15 text-amber-400" },
-  phone_required: { label: "需手机验证", cls: "bg-orange-500/15 text-orange-400" },
-  banned: { label: "已封禁", cls: "bg-red-500/15 text-red-400" },
+  pending: { label: "待注册", cls: "bg-zinc-500/15 text-zinc-700 dark:text-zinc-400" },
+  running: { label: "运行中", cls: "bg-blue-500/15 text-blue-700 dark:text-blue-400" },
+  success: { label: "成功", cls: "bg-emerald-500/15 text-emerald-800 dark:text-emerald-400" },
+  failed: { label: "失败", cls: "bg-red-500/15 text-red-700 dark:text-red-400" },
+  needs_manual: { label: "需人工介入", cls: "bg-amber-500/15 text-amber-800 dark:text-amber-400" },
+  phone_required: { label: "需手机验证", cls: "bg-orange-500/15 text-orange-800 dark:text-orange-400" },
+  banned: { label: "已封禁", cls: "bg-red-500/15 text-red-700 dark:text-red-400" },
 };
 
 // 平台注册状态：空状态视为「未注册」，success 显示为「已注册」

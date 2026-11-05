@@ -48,7 +48,9 @@ OpenAI 没有任何 API Key 可用的余额接口（实测旧计费接口返回 
 | `refreshed_at` | `TEXT` | 最近刷新时间 |
 | `created_at` | `TEXT` | 录入时间 |
 
-生成的项目 Key 不在本地保存，只在创建时显示一次。
+面板新建的项目 Key 加密保存在数据库中，完整值只在新建成功或已登录用户主动复制时返回，不写入浏览器存储。备份恢复时需要保留原 `data/secret.key`。旧记录只有脱敏值，无法还原。删除项目 Key 或移除、更换其管理凭据时清理对应的本地密文。
+
+项目列表的脱敏快照另行保存，刷新浏览器和重新打开面板时可复用；首次加载、手动刷新才向 OpenAI 获取列表。面板内新建或删除项目 Key 时直接更新已有快照。
 
 ---
 
@@ -92,8 +94,10 @@ OpenAI 没有任何 API Key 可用的余额接口（实测旧计费接口返回 
 | `PATCH` | `/api/openai/keys/{id}` | 修改；`admin_key` 传空 = 不修改 |
 | `DELETE` | `/api/openai/keys/{id}` | 删除本地记录 |
 | `POST` | `/api/openai/keys/{id}/refresh` | 校验并刷新费用 |
-| `GET` | `/api/openai/keys/{id}/api-keys` | 遍历所有项目，返回扁平列表：项目名、Key 名、`redacted_value`、类型（用户 / 服务账号）、创建时间、最近使用时间 |
-| `POST` | `/api/openai/keys/{id}/api-keys` | `{project_id, name}` → 返回明文 Key（仅此一次） |
+| `GET` | `/api/openai/keys/{id}/api-keys` | 读取本地项目列表快照，首次没有快照时查询 OpenAI；只返回脱敏值及是否可复制 |
+| `POST` | `/api/openai/keys/{id}/api-keys/refresh` | 从 OpenAI 更新项目和 Key 列表 |
+| `POST` | `/api/openai/keys/{id}/api-keys` | `{project_id, name}` → 加密保存并返回完整 Key |
+| `POST` | `/api/openai/keys/{id}/api-keys/{key_id}/copy?project_id=` | 仅返回已保存的完整 Key |
 | `DELETE` | `/api/openai/keys/{id}/api-keys/{key_id}?project_id=` | 按类型调对应删除接口 |
 
 ---
@@ -104,7 +108,7 @@ OpenAI 没有任何 API Key 可用的余额接口（实测旧计费接口返回 
 
 - 每行：名称、组织 ID、掩码 Key、状态、本月费用、剩余 / 额度（进度条，剩余不足 10% 标红）、刷新时间；操作：刷新、编辑、删除、展开。
 - 顶部：「新增 Admin Key」。新增 / 编辑弹窗字段：名称、Admin Key、额度、起算日期。
-- 展开行：该组织的项目 Key 表格，可删除；「新建 Key」选项目、填名称，成功后弹窗显示明文并提示「关闭后无法再查看」。
+- 展开行：读取该组织的项目列表，可手动刷新。已保存的项目 Key 可从列表复制；旧记录显示「仅脱敏」。
 
 ---
 

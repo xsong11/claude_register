@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { ChevronDown, ChevronRight, Copy, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "../api.js";
@@ -20,9 +20,9 @@ import {
 } from "@/components/ui/alert-dialog";
 
 const STATUS = {
-  ok: ["正常", "bg-emerald-500/15 text-emerald-400"],
-  invalid: ["Key 无效", "bg-red-500/15 text-red-400"],
-  error: ["刷新失败", "bg-amber-500/15 text-amber-400"],
+  ok: ["正常", "bg-emerald-500/15 text-emerald-800 dark:text-emerald-400"],
+  invalid: ["Key 无效", "bg-red-500/15 text-red-700 dark:text-red-400"],
+  error: ["刷新失败", "bg-amber-500/15 text-amber-800 dark:text-amber-400"],
 };
 
 const usd = (v) => (v == null ? "—" : `$${Number(v).toFixed(2)}`);
@@ -42,8 +42,10 @@ async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
     toast.success("已复制");
+    return true;
   } catch {
     toast.error("复制失败，请手动选择复制");
+    return false;
   }
 }
 
@@ -85,7 +87,7 @@ function KeyDialog({ open, onOpenChange, editing, onSaved }) {
         : await api.openaiKeyCreate(body);
       toast.success(editing ? "已保存" : `已添加「${row.name}」`);
       onOpenChange(false);
-      onSaved(row);
+      onSaved(row, Boolean(editing && form.admin_key.trim()));
     } catch (e) {
       if (e?.status !== 401) toast.error(errText(e, "保存失败"), { duration: 8000 });
     } finally {
@@ -116,6 +118,9 @@ function KeyDialog({ open, onOpenChange, editing, onSaved }) {
                 onChange={set("admin_key")} spellCheck={false} disabled={busy}
                 placeholder={editing ? `${editing.key_masked}（留空不修改）` : "sk-admin-…"} />
             </Field>
+            {editing && form.admin_key?.trim() && <p className="mt-1 text-xs text-muted-foreground">
+              更换 Admin Key 会清除这条记录下本地保存的项目 Key，请先复制保留。
+            </p>}
           </div>
           <Field id="oa-credit" label="额度（USD，可空）">
             <Input id="oa-credit" type="number" min="0" step="0.01" value={form.credit_usd ?? ""}
@@ -162,9 +167,11 @@ function SecretDialog({ secret, onClose }) {
     <AlertDialog open={!!secret} onOpenChange={(o) => !o && onClose()}>
       <AlertDialogContent className="max-w-lg">
         <AlertDialogHeader>
-          <AlertDialogTitle>已新建 Key「{secret?.name}」</AlertDialogTitle>
+          <AlertDialogTitle>{secret?.created ? "已新建 Key" : "复制 Key"}「{secret?.name}」</AlertDialogTitle>
           <AlertDialogDescription>
-            请立即复制保存：关闭后无法再查看，面板也不会保存这个 Key。
+            {secret?.copy_available
+              ? "完整 Key 已加密保存，之后仍可在列表中复制。"
+              : "请现在复制并妥善保存，关闭后无法从列表取回完整 Key。"}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="break-all rounded-md border bg-muted/40 p-2.5 font-mono text-xs select-all">
@@ -181,45 +188,63 @@ function SecretDialog({ secret, onClose }) {
   );
 }
 
-function ProjectKeys({ adminKey, onConfirm }) {
+function ProjectKeys({ adminKeyId, open, onConfirm }) {
   const [data, setData] = useState(null); // {projects, api_keys}
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const inFlight = useRef(null);
   const [projectId, setProjectId] = useState("");
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   const [secret, setSecret] = useState(null);
 
-  async function load() {
+  const load = useCallback(async (mode = "cached") => {
+    if (inFlight.current && mode !== "afterMutation") return;
     setLoading(true);
     setError("");
+    const request = mode === "refresh" ? api.openaiProjectKeysRefresh(adminKeyId) : api.openaiProjectKeys(adminKeyId);
+    inFlight.current = request;
     try {
-      const res = await api.openaiProjectKeys(adminKey.id);
-      setData(res);
-      setProjectId((p) => p || res.projects[0]?.id || "");
+      const res = await request;
+      if (inFlight.current === request) {
+        setData(res);
+        setProjectId((p) => res.projects.some(({ id }) => id === p) ? p : res.projects[0]?.id || "");
+      }
     } catch (e) {
-      if (e?.status !== 401) setError(errText(e, "加载失败"));
+      if (inFlight.current === request && e?.status !== 401) setError(errText(e, "加载失败"));
     } finally {
-      setLoading(false);
+      if (inFlight.current === request) {
+        inFlight.current = null;
+        setLoading(false);
+      }
     }
-  }
+  }, [adminKeyId]);
 
   useEffect(() => {
-    load();
-  }, [adminKey.id]);
+    if (open && !data) void load();
+  }, [open, data, load]);
 
   async function create() {
     if (!projectId || !name.trim()) return toast.error("请选择项目并填写 Key 名称");
     setCreating(true);
     try {
-      const res = await api.openaiProjectKeyCreate(adminKey.id, projectId, name.trim());
-      setSecret(res);
+      const res = await api.openaiProjectKeyCreate(adminKeyId, projectId, name.trim());
+      setSecret({ ...res, created: true });
       setName("");
-      load();
+      void load("afterMutation");
     } catch (e) {
       if (e?.status !== 401) toast.error(errText(e, "新建失败"), { duration: 8000 });
     } finally {
       setCreating(false);
+    }
+  }
+
+  async function copyProjectKey(k) {
+    try {
+      const { value } = await api.openaiProjectKeyCopy(adminKeyId, k.project_id, k.id);
+      if (!(await copyText(value))) setSecret({ name: k.name || k.id, value, copy_available: true });
+    } catch (e) {
+      if (e?.status !== 401) toast.error(errText(e, "复制失败"));
     }
   }
 
@@ -232,9 +257,9 @@ function ProjectKeys({ adminKey, onConfirm }) {
           : "删除后使用它的程序将立即失效，无法恢复。",
       onConfirm: async () => {
         try {
-          await api.openaiProjectKeyDelete(adminKey.id, k.project_id, k.id);
+          await api.openaiProjectKeyDelete(adminKeyId, k.project_id, k.id);
           toast.success("已删除");
-          load();
+          void load("afterMutation");
         } catch (e) {
           if (e?.status !== 401) toast.error(errText(e, "删除失败"), { duration: 8000 });
         }
@@ -242,37 +267,42 @@ function ProjectKeys({ adminKey, onConfirm }) {
     });
   }
 
+  if (!open) return null;
+
   return (
     <div className="mt-2 space-y-2 border-t pt-2.5">
       <SecretDialog secret={secret} onClose={() => setSecret(null)} />
-      {error && <div className="text-xs text-red-400">{error}</div>}
-      {data && (
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            className="h-8 rounded-md border bg-background px-2 text-xs"
-            value={projectId}
-            onChange={(e) => setProjectId(e.target.value)}
-            disabled={creating}
-          >
-            {data.projects.map((p) => (
-              <option key={p.id} value={p.id}>{p.name || p.id}</option>
-            ))}
-          </select>
-          <Input
-            className="h-8 w-48 text-xs"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="新 Key 名称"
-            disabled={creating}
-          />
-          <Button size="sm" variant="outline" onClick={create} disabled={creating || !data.projects.length}>
-            <Plus /> {creating ? "创建中…" : "新建 Key"}
-          </Button>
-          <Button size="sm" variant="ghost" onClick={load} disabled={loading}>
-            <RefreshCw className={cn(loading && "animate-spin")} />
-          </Button>
-        </div>
-      )}
+      {error && <div className="text-xs text-destructive">{error}</div>}
+      <div className="flex flex-wrap items-center gap-2">
+        {data && (
+          <>
+            <select
+              className="h-8 rounded-md border bg-background px-2 text-xs"
+              value={projectId}
+              onChange={(e) => setProjectId(e.target.value)}
+              disabled={creating}
+            >
+              {data.projects.map((p) => (
+                <option key={p.id} value={p.id}>{p.name || p.id}</option>
+              ))}
+            </select>
+            <Input
+              className="h-8 w-48 text-xs"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="新 Key 名称"
+              disabled={creating}
+            />
+            <Button size="sm" variant="outline" onClick={create} disabled={creating || !data.projects.length}>
+              <Plus /> {creating ? "创建中…" : "新建 Key"}
+            </Button>
+          </>
+        )}
+        <Button size="sm" variant="ghost" onClick={() => load("refresh")} disabled={loading}>
+          <RefreshCw className={cn(loading && "animate-spin")} /> 刷新项目 Key
+        </Button>
+        {data?.refreshed_at && <span className="text-xs text-muted-foreground">项目列表更新于 {fmtTime(data.refreshed_at)}</span>}
+      </div>
       {loading && !data ? (
         <div className="text-xs text-muted-foreground">加载中…</div>
       ) : data && data.api_keys.length === 0 ? (
@@ -293,21 +323,31 @@ function ProjectKeys({ adminKey, onConfirm }) {
             </thead>
             <tbody>
               {data.api_keys.map((k) => (
-                <tr key={k.id} className="border-t">
-                  <td className="py-1.5 pr-3">{k.project_name}</td>
-                  <td className="py-1.5 pr-3">{k.name}</td>
-                  <td className="py-1.5 pr-3 font-mono">{shortRedacted(k.redacted_value)}</td>
-                  <td className="py-1.5 pr-3">
-                    {k.owner_type === "service_account" ? "服务账号" : `用户 ${k.owner_name}`}
-                  </td>
-                  <td className="py-1.5 pr-3">{fmtTime(k.created_at)}</td>
-                  <td className="py-1.5 pr-3">{fmtTime(k.last_used_at) || "从未"}</td>
-                  <td className="py-1.5 text-right">
-                    <Button size="icon-sm" variant="ghost" title="删除" onClick={() => remove(k)}>
-                      <Trash2 className="text-red-400" />
-                    </Button>
-                  </td>
-                </tr>
+                  <tr key={k.id} className="border-t">
+                    <td className="py-1.5 pr-3">{k.project_name}</td>
+                    <td className="py-1.5 pr-3">{k.name}</td>
+                    <td className="py-1.5 pr-3">
+                      <div className="flex items-center gap-1.5 whitespace-nowrap">
+                        <code>{shortRedacted(k.redacted_value) || "—"}</code>
+                        {k.copy_available ? (
+                          <Button size="xs" variant="outline" type="button" title="复制完整 Key"
+                            aria-label={`复制 Key：${k.name || k.id}`} onClick={() => copyProjectKey(k)}>
+                            <Copy /> 复制
+                          </Button>
+                        ) : <span className="text-muted-foreground" title="这条记录没有保存完整 Key">仅脱敏</span>}
+                      </div>
+                    </td>
+                    <td className="py-1.5 pr-3">
+                      {k.owner_type === "service_account" ? "服务账号" : `用户 ${k.owner_name}`}
+                    </td>
+                    <td className="py-1.5 pr-3">{fmtTime(k.created_at)}</td>
+                    <td className="py-1.5 pr-3">{fmtTime(k.last_used_at) || "从未"}</td>
+                    <td className="py-1.5 text-right">
+                      <Button size="icon-sm" variant="ghost" title="删除" onClick={() => remove(k)}>
+                        <Trash2 className="text-destructive" />
+                      </Button>
+                    </td>
+                  </tr>
               ))}
             </tbody>
           </table>
@@ -323,7 +363,7 @@ function Remaining({ k }) {
   const low = ratio < 0.1;
   return (
     <span className="flex items-center gap-2">
-      <span className={cn("font-medium", low && "text-red-400")}>
+      <span className={cn("font-medium", low && "text-destructive")}>
         {usd(k.remaining_usd)} / {usd(k.credit_usd)}
       </span>
       <span className="h-1.5 w-24 overflow-hidden rounded-full bg-muted">
@@ -359,10 +399,12 @@ export default function OpenAI() {
     load();
   }, []);
 
-  const upsert = (row) =>
+  const upsert = (row, resetProjects = false) =>
     setKeys((list) =>
       list.some((k) => k.id === row.id)
-        ? list.map((k) => (k.id === row.id ? row : k))
+        ? list.map((k) => (k.id === row.id
+          ? { ...row, projectVersion: (k.projectVersion || 0) + Number(resetProjects) }
+          : k))
         : [...list, row],
     );
 
@@ -452,6 +494,7 @@ export default function OpenAI() {
                       type="button"
                       className="shrink-0 text-muted-foreground hover:text-foreground"
                       title={open ? "收起项目 Key" : "展开项目 Key"}
+                      aria-expanded={open}
                       onClick={() => flag(setExpanded, k.id, !open)}
                     >
                       {open ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
@@ -475,7 +518,7 @@ export default function OpenAI() {
                         {k.refreshed_at && <span>刷新于 {fmtTime(k.refreshed_at)}</span>}
                       </span>
                       {k.status !== "ok" && k.last_error && (
-                        <span className="text-xs text-red-400/90">{k.last_error}</span>
+                        <span className="text-xs text-destructive">{k.last_error}</span>
                       )}
                     </span>
                     <span className="flex shrink-0 gap-1">
@@ -486,11 +529,11 @@ export default function OpenAI() {
                         编辑
                       </Button>
                       <Button variant="ghost" size="icon-sm" title="删除" onClick={() => remove(k)}>
-                        <Trash2 className="text-red-400" />
+                        <Trash2 className="text-destructive" />
                       </Button>
                     </span>
                   </div>
-                  {open && <ProjectKeys adminKey={k} onConfirm={setConfirm} />}
+                  <ProjectKeys key={k.projectVersion || 0} adminKeyId={k.id} open={open} onConfirm={setConfirm} />
                 </li>
               );
             })}

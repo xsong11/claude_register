@@ -13,6 +13,7 @@ dependencies = [
     "sse-starlette>=2.1",
     "curl-cffi>=0.13",
     "python-xlib>=0.33",
+    "cryptography>=45",
 ]
 
 [project.scripts]

@@ -2,15 +2,22 @@
 
 - 鉴权用 OpenAI Platform 的 Admin Key（sk-admin-...），只调 /v1/organization/* 管理接口。
 - OpenAI 没有 API Key 可用的余额接口，剩余额度 = 本地填的额度 − 起算日至今的费用。
-- Admin Key 只回显掩码；新建的项目 Key 明文只在创建响应里出现一次，不落库。
+- 列表只回显掩码；面板创建的项目 Key 加密保存，登录后可按条复制。
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
+import secrets
+from collections import defaultdict
 from datetime import date, datetime, timezone
 
 import httpx
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from claude_register.console import log
 from server import db
@@ -264,6 +271,15 @@ async def _body(request: Request) -> dict:
 
 
 def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
+    project_locks = defaultdict(asyncio.Lock)
+    cipher = AESGCM(hmac.digest(state.secret.encode(), b"openai-project-secrets:v1", "sha256"))
+
+    def binding(key_id: int, project_id: str, api_key_id: str) -> bytes:
+        return json.dumps((key_id, project_id, api_key_id), separators=(",", ":")).encode()
+
+    def private_response(payload: dict) -> JSONResponse:
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
     def load(key_id: int) -> dict:
         row = db.get_openai_key(state.conn, key_id)
         if row is None:
@@ -331,7 +347,6 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
 
     @app.patch("/api/openai/keys/{key_id}")
     async def openai_key_update(key_id: int, request: Request, _=Depends(require_auth)):
-        row = load(key_id)
         body = await _body(request)
         fields = _parse_credit(body)
         if "name" in body:
@@ -340,19 +355,22 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
                 raise HTTPException(status_code=400, detail="名称不能为空")
             fields["name"] = name
         new_key = str(body.get("admin_key") or "").strip()
-        key_changed = bool(new_key) and new_key != row["admin_key"]
-        if key_changed:
-            fields.update({"admin_key": new_key, "status": "", "org_id": ""})
-        db.update_openai_key(state.conn, key_id, fields)
-        row = load(key_id)
-        if key_changed or "credit_since" in fields:
-            row = await asyncio.to_thread(refresh, row)
+        async with project_locks[key_id]:
+            row = load(key_id)
+            key_changed = bool(new_key) and new_key != row["admin_key"]
+            if key_changed:
+                fields.update({"admin_key": new_key, "status": "", "org_id": ""})
+            db.update_openai_key(state.conn, key_id, fields)
+            row = load(key_id)
+            if key_changed or "credit_since" in fields:
+                row = await asyncio.to_thread(refresh, row)
         return public_row(row)
 
     @app.delete("/api/openai/keys/{key_id}")
-    def openai_key_delete(key_id: int, _=Depends(require_auth)):
-        row = load(key_id)
-        db.delete_openai_key(state.conn, key_id)
+    async def openai_key_delete(key_id: int, _=Depends(require_auth)):
+        async with project_locks[key_id]:
+            row = load(key_id)
+            db.delete_openai_key(state.conn, key_id)
         log(f"已删除 OpenAI Admin Key：#{key_id} {row.get('name')}")
         return {"ok": True}
 
@@ -361,8 +379,7 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
         row = await asyncio.to_thread(refresh, load(key_id))
         return public_row(row)
 
-    @app.get("/api/openai/keys/{key_id}/api-keys")
-    async def openai_api_keys(key_id: int, _=Depends(require_auth)):
+    async def project_snapshot(key_id: int, *, force: bool = False) -> dict:
         def work():
             with client_for(key_id) as c:
                 projects = [p for p in c.list_projects() if not p.get("archived_at")]
@@ -370,14 +387,33 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
                         for p in projects for k in c.list_api_keys(p["id"])]
                 return projects, keys
 
-        try:
-            projects, keys = await asyncio.to_thread(work)
-        except OpenAIAdminError as exc:
-            raise upstream(exc) from None
-        return {
-            "projects": [{"id": p.get("id"), "name": p.get("name") or ""} for p in projects],
-            "api_keys": keys,
-        }
+        async with project_locks[key_id]:
+            load(key_id)
+            snapshot = db.get_openai_project_snapshot(state.conn, key_id)
+            if force or snapshot is None:
+                try:
+                    projects, keys = await asyncio.to_thread(work)
+                except OpenAIAdminError as exc:
+                    raise upstream(exc) from None
+                snapshot = {
+                    "projects": [{"id": p.get("id"), "name": p.get("name") or ""} for p in projects],
+                    "api_keys": keys,
+                    "refreshed_at": state.now_fn(),
+                }
+                with state.conn:
+                    db.put_openai_project_snapshot(state.conn, key_id, snapshot)
+            saved = db.list_openai_project_secret_refs(state.conn, key_id)
+            return {**snapshot, "api_keys": [
+                {**k, "copy_available": (k["project_id"], k["id"]) in saved} for k in snapshot["api_keys"]
+            ]}
+
+    @app.get("/api/openai/keys/{key_id}/api-keys")
+    async def openai_api_keys(key_id: int, _=Depends(require_auth)):
+        return private_response(await project_snapshot(key_id))
+
+    @app.post("/api/openai/keys/{key_id}/api-keys/refresh")
+    async def openai_api_keys_refresh(key_id: int, _=Depends(require_auth)):
+        return private_response(await project_snapshot(key_id, force=True))
 
     @app.post("/api/openai/keys/{key_id}/api-keys")
     async def openai_api_key_create(key_id: int, request: Request, _=Depends(require_auth)):
@@ -391,21 +427,57 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
             with client_for(key_id) as c:
                 return c.create_service_account(project_id, name)
 
-        try:
-            sa = await asyncio.to_thread(work)
-        except OpenAIAdminError as exc:
-            raise upstream(exc) from None
-        api_key = sa.get("api_key") if isinstance(sa.get("api_key"), dict) else {}
-        if not api_key.get("value"):
-            raise HTTPException(status_code=502, detail="OpenAI 未返回 Key 明文")
-        log(f"已新建 OpenAI 项目 Key：Admin #{key_id} {project_id} {name}（{api_key.get('id')}）")
-        return {
-            "id": api_key.get("id") or "",
-            "name": api_key.get("name") or name,
-            "value": api_key["value"],
+        async with project_locks[key_id]:
+            try:
+                sa = await asyncio.to_thread(work)
+            except OpenAIAdminError as exc:
+                raise upstream(exc) from None
+            api_key = sa.get("api_key") if isinstance(sa.get("api_key"), dict) else {}
+            value = api_key.get("value")
+            if not isinstance(value, str) or not value:
+                raise HTTPException(status_code=502, detail="OpenAI 未返回 Key 明文")
+            api_key_id = api_key.get("id") or ""
+            created_name = sa.get("name") or name
+            if api_key_id:
+                nonce = secrets.token_bytes(12)
+                ciphertext = nonce + cipher.encrypt(nonce, value.encode(), binding(key_id, project_id, api_key_id))
+                snapshot = db.get_openai_project_snapshot(state.conn, key_id)
+                with state.conn:
+                    db.put_openai_project_secret(state.conn, key_id, project_id, api_key_id, ciphertext)
+                    if snapshot is not None:
+                        project = next((p for p in snapshot["projects"] if p["id"] == project_id), None)
+                        if project is None:
+                            project = {"id": project_id, "name": project_id}
+                            snapshot["projects"].append(project)
+                        created = summarize_api_key(project, {
+                            "id": api_key_id, "name": created_name,
+                            "redacted_value": mask_key(value), "created_at": api_key.get("created_at"),
+                            "owner": {"type": "service_account", "service_account": {"name": created_name}},
+                        })
+                        snapshot["api_keys"] = [k for k in snapshot["api_keys"]
+                                                if (k["project_id"], k["id"]) != (project_id, api_key_id)] + [created]
+                        db.put_openai_project_snapshot(state.conn, key_id, snapshot)
+        log(f"已新建 OpenAI 项目 Key：Admin #{key_id} {project_id} {name}（{api_key_id}）")
+        return private_response({
+            "id": api_key_id,
+            "name": created_name,
+            "value": value,
             "project_id": project_id,
             "service_account_id": sa.get("id") or "",
-        }
+            "copy_available": bool(api_key_id),
+        })
+
+    @app.post("/api/openai/keys/{key_id}/api-keys/{api_key_id}/copy")
+    async def openai_api_key_copy(key_id: int, api_key_id: str, project_id: str, _=Depends(require_auth)):
+        load(key_id)
+        ciphertext = db.get_openai_project_secret(state.conn, key_id, project_id, api_key_id)
+        if ciphertext is None:
+            raise HTTPException(status_code=404, detail="此 Key 未保存完整值，只能查看脱敏值")
+        try:
+            value = cipher.decrypt(ciphertext[:12], ciphertext[12:], binding(key_id, project_id, api_key_id))
+        except (InvalidTag, ValueError):
+            raise HTTPException(status_code=409, detail="此 Key 无法解密，请检查面板密钥是否与数据库匹配") from None
+        return private_response({"value": value.decode()})
 
     @app.delete("/api/openai/keys/{key_id}/api-keys/{api_key_id}")
     async def openai_api_key_delete(key_id: int, api_key_id: str, project_id: str,
@@ -421,9 +493,17 @@ def register_openai_routes(app: FastAPI, state, *, require_auth) -> None:
                 else:
                     c.delete_api_key(project_id, api_key_id)
 
-        try:
-            await asyncio.to_thread(work)
-        except OpenAIAdminError as exc:
-            raise upstream(exc) from None
+        async with project_locks[key_id]:
+            try:
+                await asyncio.to_thread(work)
+            except OpenAIAdminError as exc:
+                raise upstream(exc) from None
+            snapshot = db.get_openai_project_snapshot(state.conn, key_id)
+            with state.conn:
+                db.delete_openai_project_secret(state.conn, key_id, project_id, api_key_id)
+                if snapshot is not None:
+                    snapshot["api_keys"] = [k for k in snapshot["api_keys"]
+                                            if (k["project_id"], k["id"]) != (project_id, api_key_id)]
+                    db.put_openai_project_snapshot(state.conn, key_id, snapshot)
         log(f"已删除 OpenAI 项目 Key：Admin #{key_id} {project_id} {api_key_id}")
         return {"ok": True}

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Users, Server, Settings as SettingsIcon, Sparkles, LogOut, KeyRound, Wallet } from "lucide-react";
+import { Play, FlaskConical, Users, Server, Settings as SettingsIcon, Sparkles, LogOut, KeyRound, Wallet, Moon, Sun } from "lucide-react";
 import { toast } from "sonner";
 import { api, SESSION_EXPIRED_EVENT } from "./api.js";
 import { useRunStream } from "./hooks/useRunStream.js";
 import { Toaster } from "@/components/ui/sonner";
+import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import {
   Sidebar,
@@ -14,16 +15,13 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarMenuSub,
-  SidebarMenuSubButton,
-  SidebarMenuSubItem,
   SidebarProvider,
   SidebarRail,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import Login from "./pages/Login.jsx";
 import Register from "./pages/Register.jsx";
-import Accounts from "./pages/Accounts.jsx";
+import Workspace, { WorkspaceHeader } from "./pages/Workspace.jsx";
 import Nodes from "./pages/Nodes.jsx";
 import Proxies from "./pages/Proxies.jsx";
 import Settings from "./pages/Settings.jsx";
@@ -31,8 +29,9 @@ import Sub2API from "./pages/Sub2API.jsx";
 import OpenAI from "./pages/OpenAI.jsx";
 
 const NAV = [
-  { key: "register", label: "注册任务", description: "创建与监控自动化任务", Icon: Play },
-  { key: "accounts", label: "账号管理", description: "查看账号状态与凭据", Icon: Users },
+  { key: "register", label: "注册工作台", description: "导入邮箱与运行注册任务", Icon: Play },
+  { key: "detect", label: "待检测", description: "核对登录、套餐和限制", Icon: FlaskConical },
+  { key: "accounts", label: "账号库", description: "按平台查看和管理账号", Icon: Users },
   { key: "sub2api", label: "sub2api 同步", description: "重新授权并写回 sub2api", Icon: KeyRound },
   { key: "openai", label: "OpenAI", description: "Admin Key 费用、剩余额度与项目 Key", Icon: Wallet },
   { key: "proxies", label: "代理池", description: "管理网络出口", Icon: Server },
@@ -42,68 +41,62 @@ const NAV = [
 
 const VIEW_KEYS = NAV.map((n) => n.key);
 
-const UNGROUPED = "__ungrouped__";
+const STAGE_FOR = { register: "register", detect: "detect", accounts: "library" };
 
 function parseHash() {
   const [path, qs = ""] = window.location.hash.replace(/^#\/?/, "").split("?");
+  const params = new URLSearchParams(qs);
+  const requested = params.get("platform");
   return {
     view: VIEW_KEYS.includes(path) ? path : "register",
-    group: new URLSearchParams(qs).get("group") || "",
+    platform: requested === "chatgpt" || (path === "register" && requested === "unassigned") ? requested : "claude",
+    group: params.get("group") || "",
   };
 }
 
-function AccountGroupNav({ groups, active, onPick }) {
-  const total = groups.groups.reduce((n, g) => n + g.count, 0) + groups.ungrouped_count;
-  const items = [
-    ["", "全部账号", total],
-    ...groups.groups.map((g) => [g.name, g.name, g.count]),
-    ...(groups.ungrouped_count && groups.groups.length ? [[UNGROUPED, "未分组", groups.ungrouped_count]] : []),
-  ];
+function ThemeToggle({ theme, onToggle }) {
+  const Icon = theme === "dark" ? Sun : Moon;
+  const next = theme === "dark" ? "浅色主题" : "深色主题";
+  const label = `切换到${next}`;
   return (
-    <SidebarMenuSub>
-      {items.map(([value, label, count]) => (
-        <SidebarMenuSubItem key={value || "__all__"}>
-          <SidebarMenuSubButton
-            asChild
-            size="sm"
-            isActive={active === value}
-          >
-            <button type="button" className="w-full" title={label} onClick={() => onPick(value)}>
-              <span className={value === UNGROUPED ? "text-muted-foreground" : ""}>{label}</span>
-              <span className="ml-auto text-[11px] text-muted-foreground tabular-nums">{count}</span>
-            </button>
-          </SidebarMenuSubButton>
-        </SidebarMenuSubItem>
-      ))}
-    </SidebarMenuSub>
+    <Button type="button" variant="ghost" size="sm" className="px-2 has-[>svg]:px-2"
+      aria-label={label} title={label} onClick={onToggle}>
+      <Icon aria-hidden="true" />
+      <span className="hidden sm:inline">{next}</span>
+    </Button>
   );
 }
 
 export default function App() {
+  const [theme, setTheme] = useState(() => document.documentElement.classList.contains("dark") ? "dark" : "light");
+  function toggleTheme() {
+    const next = theme === "dark" ? "light" : "dark";
+    document.documentElement.classList.toggle("dark", next === "dark");
+    setTheme(next);
+    try { localStorage.setItem("claude-register.theme", next); } catch {}
+  }
+
   // Toaster 只挂一个、放在所有分支之外：登录态切换时若跟着分支卸载/重挂，
   // 切换瞬间发出的提示（如「登录已失效」）会丢。
   return (
     <>
-      <AppBody />
-      <Toaster position="top-right" />
+      <AppBody themeToggle={<ThemeToggle theme={theme} onToggle={toggleTheme} />} />
+      <Toaster position="top-right" theme={theme} />
     </>
   );
 }
 
-function AppBody() {
+function AppBody({ themeToggle }) {
   const [authed, setAuthed] = useState(null); // null=checking, false=need login, true=ok
   const authedRef = useRef(authed);
   authedRef.current = authed;
   // 引导态：服务端还没设面板密码，只能去设置页设密码，其余接口全 401。
   const [bootstrap, setBootstrap] = useState(false);
   const [route, setRoute] = useState(parseHash);
-  const view = route.view;
-  const [groups, setGroups] = useState({ groups: [], ungrouped_count: 0 });
+  const { view, platform } = route;
+  const stage = STAGE_FOR[view];
+  const runPanel = useRef(null);
   const runStream = useRunStream();
-
-  useEffect(() => {
-    if (authed && !bootstrap) api.listGroups().then(setGroups).catch(() => {});
-  }, [authed, bootstrap]);
 
   useEffect(() => {
     api
@@ -137,14 +130,9 @@ function AppBody() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  function navigate(next) {
-    window.location.hash = `#/${next}`;
-  }
-
-  function navigateGroup(group) {
-    window.location.hash = group
-      ? `#/accounts?${new URLSearchParams({ group })}`
-      : "#/accounts";
+  function navigate(next, selected = platform) {
+    const keepPlatform = selected === "chatgpt" || (next === "register" && selected === "unassigned");
+    window.location.hash = `#/${next}${keepPlatform ? `?${new URLSearchParams({ platform: selected })}` : ""}`;
   }
 
   async function logout() {
@@ -167,12 +155,15 @@ function AppBody() {
 
   if (!authed) {
     return (
-      <Login
-        onOk={() => {
-          setBootstrap(false);
-          setAuthed(true);
-        }}
-      />
+      <>
+        <div className="absolute top-4 right-4">{themeToggle}</div>
+        <Login
+          onOk={() => {
+            setBootstrap(false);
+            setAuthed(true);
+          }}
+        />
+      </>
     );
   }
 
@@ -180,6 +171,7 @@ function AppBody() {
   if (bootstrap) {
     return (
       <div className="app-content mx-auto min-w-0 max-w-3xl px-8 py-8 max-md:px-4">
+        <div className="mb-3 flex justify-end">{themeToggle}</div>
         <div className="mb-5 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
           <p className="font-semibold">面板尚未设置密码</p>
           <p className="mt-1 text-muted-foreground">
@@ -221,13 +213,6 @@ function AppBody() {
                     <Icon />
                     <span>{label}</span>
                   </SidebarMenuButton>
-                  {key === "accounts" && groups.groups.length > 0 && (
-                    <AccountGroupNav
-                      groups={groups}
-                      active={view === "accounts" ? route.group : null}
-                      onPick={navigateGroup}
-                    />
-                  )}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>
@@ -235,11 +220,12 @@ function AppBody() {
         </SidebarContent>
         <SidebarRail />
       </Sidebar>
-      <SidebarInset>
+      <SidebarInset className="min-w-0">
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
           <Separator orientation="vertical" className="mr-1 h-4" />
           <div className="flex-1"><span className="text-sm font-semibold">{current?.label}</span><span className="ml-3 hidden text-xs text-muted-foreground sm:inline">{current?.description}</span></div>
+          {themeToggle}
           <button
             type="button"
             onClick={logout}
@@ -248,18 +234,15 @@ function AppBody() {
             <LogOut className="size-3.5" /> 退出登录
           </button>
         </header>
-        <div className="app-content min-w-0 max-w-6xl flex-1 px-8 py-8 max-md:px-4">
-          {view === "register" && <Register runStream={runStream} />}
-          {view === "accounts" && (
-            <Accounts
-              attach={runStream.attach}
-              running={runStream.activeStatus === "running"}
-              navigate={navigate}
-              group={route.group}
-              onGroupChange={navigateGroup}
-              onGroupsLoaded={setGroups}
-            />
-          )}
+        <div className={`app-content min-w-0 flex-1 px-8 py-8 max-md:px-4 ${stage === "library" || stage === "detect" ? "w-full" : "max-w-6xl"}`}>
+          {stage && <>
+            <WorkspaceHeader stage={stage} platform={platform} onPlatform={(value) => navigate(view, value)} />
+            <div className="space-y-5" key={`${view}:${platform}:${route.group}`}>
+              {stage === "register" && platform !== "unassigned" && <div ref={runPanel}><Register runStream={runStream} platform={platform} /></div>}
+              <Workspace platform={platform} stage={stage} runStream={runStream} initialGroup={route.group}
+                onRun={() => runPanel.current?.scrollIntoView({ behavior: "smooth", block: "start" })} />
+            </div>
+          </>}
           {view === "sub2api" && <Sub2API navigate={navigate} />}
           {view === "openai" && <OpenAI />}
           {view === "proxies" && <Proxies />}

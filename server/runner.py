@@ -10,7 +10,7 @@ from claude_register import browser
 from claude_register import console
 from claude_register import flow as flow_module
 from claude_register.outlook import OUTLOOK_MAIL_URL, parse_outlook_line
-from server import db
+from server import db, workspace_store
 
 
 class RunnerBusy(Exception):
@@ -104,7 +104,7 @@ class Runner:
             return
         sink(f"已获取 OAuth 令牌（过期 {row.get('oauth_expires_at') or '未知'}）")
 
-    def _prepare(self, config, email, proxy_override: bool) -> _Prepared:
+    def _prepare(self, config, email, proxy_override: bool, platform: str = "claude") -> _Prepared:
         password = mail_key = mail_base_url = ""
         if email:
             parsed_line = parse_outlook_line(email)
@@ -113,8 +113,12 @@ class Runner:
                 password = parsed_line.password
                 mail_key = parsed_line.mail_key
                 mail_base_url = OUTLOOK_MAIL_URL
-        existing = db.get_account(self.conn, email.strip().lower()) if email else None
+        existing = workspace_store.mailbox(self.conn, email.strip()) if email else None
         if existing is not None:
+            email = existing["email"]
+            scoped = workspace_store.find(self.conn, email, platform)
+            if scoped:
+                existing["proxy"] = scoped["proxy"]
             password = password or str(existing.get("password") or "")
             mail_key = mail_key or str(existing.get("mail_key") or "")
             mail_base_url = mail_base_url or str(existing.get("mail_base_url") or "")
@@ -174,7 +178,10 @@ class Runner:
         if self._deleted_meanwhile(prep, sink):
             return None, "needs_manual"
         if isinstance(result, dict) and result.get("email"):
-            acct_email = str(result.get("email") or "")
+            acct_email = str(result["email"]).strip()
+            current = workspace_store.mailbox(self.conn, acct_email)
+            if current:
+                acct_email = current["email"]
             domain_part = self._set_run_email(rid, acct_email, domain)
             if result.get("sessionKey"):
                 acct_status = "success"
@@ -212,10 +219,16 @@ class Runner:
                 ),
             )
             sink(
-                f"账号入库：{acct_email} status={acct_status} "
+                f"已保存 Claude 注册结果：{acct_email} status={acct_status} "
                 f"sessionKey={'有' if result.get('sessionKey') else '无'}"
             )
             self._after_persist(acct_email, result, group_name, sink)
+            workspace_store.record_registration(
+                self.conn, acct_email, "claude", acct_status, group=group_name,
+                proxy=str(result.get("proxy") or getattr(config, "register_proxy", "")
+                          or prev.get("proxy") or ""), now=self.now_fn(),
+                got_session=bool(result.get("sessionKey")),
+            )
             if result.get("sessionKey") and getattr(
                 config, "oauth_auto_after_register", False,
             ):
@@ -259,6 +272,9 @@ class Runner:
                                           {"chatgpt_last_run_id": rid})
             return "needs_manual"
         acct_email = str(result["email"]).strip().lower()
+        current = workspace_store.mailbox(self.conn, acct_email)
+        if current:
+            acct_email = current["email"]
         domain_part = self._set_run_email(rid, acct_email, domain)
         prev = prep.existing or db.get_account(self.conn, acct_email)
         session_token = str(result.get("chatgpt_session_token") or "")
@@ -323,12 +339,16 @@ class Runner:
             })
         db.update_account_chatgpt(self.conn, acct_email, values)
         sink(
-            f"ChatGPT 入库：{acct_email} chatgpt_status={cstatus} "
+            f"已保存 ChatGPT 注册结果：{acct_email} chatgpt_status={cstatus} "
             f"sessionToken={'有' if session_token else '无'} "
             f"accessToken={'有' if access_token else '无'} "
             f"密码登录={'可用' if result.get('chatgpt_password_set') else '未设置'}"
         )
         self._after_persist(acct_email, result, group_name, sink)
+        workspace_store.record_registration(
+            self.conn, acct_email, "chatgpt", cstatus, group=group_name,
+            proxy=proxy or str((prev or {}).get("proxy") or ""), now=self.now_fn(), got_session=got,
+        )
         return cstatus
 
     def _run(self, rid, out_dir: Path, config, email, domain, fns, q, proxy_override: bool = False,
@@ -358,7 +378,7 @@ class Runner:
                 else:
                     sink(f"开始用同一邮箱注册 ChatGPT：{acct_email}")
             if platform == "chatgpt" or (platform == "both" and acct_email):
-                prep = self._prepare(config, acct_email, proxy_override)
+                prep = self._prepare(config, acct_email, proxy_override, "chatgpt")
                 outcomes.append(
                     self._run_chatgpt(rid, prep, domain, fns["chatgpt"], group_name, sink))
             # 流程没抛异常不代表注册成功：任一平台没拿到凭据，整次运行就不算成功

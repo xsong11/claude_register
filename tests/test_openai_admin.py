@@ -245,6 +245,69 @@ def test_list_project_keys(env):
     assert by_id["key_sa"]["project_name"] == "Default project"
 
 
+def test_project_snapshot_is_reused_after_restart_until_manual_refresh(env, tmp_path):
+    app, c, fake = env
+    kid = _add(c).json()["id"]
+    path = f"/api/openai/keys/{kid}/api-keys"
+    before = c.get(path).json()
+    assert len(before["api_keys"]) == 2
+    fake.keys["proj_A"] = []
+    fake.calls.clear()
+    app.state.cr.conn.close()
+
+    restarted = create_app(data_dir=tmp_path, config_path=tmp_path / "config.yaml", now_fn=lambda: NOW)
+    other = TestClient(restarted)
+    other.post("/api/login", json={"password": "pw"})
+    assert other.get(path).json() == before
+    assert not fake.calls
+
+    assert other.post(f"{path}/refresh").json()["api_keys"] == []
+    assert len(fake.calls) == 2
+    assert other.get(path).json()["api_keys"] == []
+    assert len(fake.calls) == 2
+
+
+def test_project_copy_persists_is_scoped_and_is_removed_on_delete(env, tmp_path):
+    app, c, fake = env
+    kid = _add(c).json()["id"]
+    other_kid = _add(c, name="另一条记录").json()["id"]
+    path = f"/api/openai/keys/{kid}/api-keys"
+    assert c.get(path).status_code == 200
+    created = c.post(path, json={"project_id": "proj_A", "name": "new"}).json()
+    value = created["value"]
+    assert created["copy_available"]
+    ciphertext = db.get_openai_project_secret(app.state.cr.conn, kid, "proj_A", "key_new")
+    assert isinstance(ciphertext, bytes) and value.encode() not in ciphertext
+    assert value not in json.dumps(db.get_openai_project_snapshot(app.state.cr.conn, kid))
+    app.state.cr.conn.close()
+
+    restarted = create_app(data_dir=tmp_path, config_path=tmp_path / "config.yaml", now_fn=lambda: NOW)
+    other = TestClient(restarted)
+    copy_path = f"{path}/key_new/copy"
+    assert other.post(copy_path, params={"project_id": "proj_A"}).status_code == 401
+    other.post("/api/login", json={"password": "pw"})
+    fake.calls.clear()
+    listed = other.get(path)
+    assert value not in listed.text
+    keys = {k["id"]: k for k in listed.json()["api_keys"]}
+    assert keys["key_new"]["copy_available"] and not keys["key_sa"]["copy_available"]
+    copied = other.post(copy_path, params={"project_id": "proj_A"})
+    assert copied.json() == {"value": value}
+    assert copied.headers["cache-control"] == "no-store"
+    assert other.post(copy_path, params={"project_id": "different"}).status_code == 404
+    assert other.post(f"/api/openai/keys/{other_kid}/api-keys/key_new/copy",
+                      params={"project_id": "proj_A"}).status_code == 404
+    assert other.post(f"{path}/key_sa/copy", params={"project_id": "proj_A"}).status_code == 404
+    assert not fake.calls
+
+    fake.keys["proj_A"].append({"id": "key_new", "owner": {
+        "type": "service_account", "service_account": {"id": "svc_new"},
+    }})
+    assert other.delete(f"{path}/key_new", params={"project_id": "proj_A"}).status_code == 200
+    assert other.post(copy_path, params={"project_id": "proj_A"}).status_code == 404
+    assert "key_new" not in {k["id"] for k in other.get(path).json()["api_keys"]}
+
+
 def test_create_project_key(env):
     _, c, fake = env
     kid = _add(c).json()["id"]

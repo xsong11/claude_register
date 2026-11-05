@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, HTTPException
 
 from claude_register.console import log
 from claude_register.oauth import OAuthError
-from server import db, oauth_acquire
+from server import db, oauth_acquire, workspace_store
 
 PLATFORM = "anthropic"
 ACCOUNT_TYPE = "oauth"
@@ -175,6 +175,7 @@ def summarize(acct: dict, local: dict | None) -> dict:
         "local": None if local is None else {
             "email": local["email"],
             "has_session_key": bool(local.get("session_key")),
+            "eligible_for_sync": local.get("eligible_for_sync", True),
             "check_status": local.get("check_status") or "",
             "checked_at": local.get("checked_at") or "",
             "oauth_at": local.get("oauth_at") or "",
@@ -191,7 +192,8 @@ def register_sub2api_routes(app: FastAPI, state, *, require_auth) -> None:
             raise HTTPException(status_code=400, detail=str(exc)) from None
 
     def local_by_email() -> dict[str, dict]:
-        return {str(r["email"]).lower(): r for r in db.list_accounts(state.conn) if r.get("email")}
+        return {r["email"].lower(): {**r, "eligible_for_sync": workspace_store.eligible_for_sync(state.conn, r["email"])}
+                for r in db.list_accounts(state.conn) if r.get("email")}
 
     @app.get("/api/sub2api/accounts")
     async def sub2api_accounts(_=Depends(require_auth)):
@@ -226,17 +228,23 @@ def register_sub2api_routes(app: FastAPI, state, *, require_auth) -> None:
             row = local_by_email().get(email)
             if row is None:
                 raise HTTPException(status_code=404, detail=f"本地没有账号 {email}")
+            if not workspace_store.eligible_for_sync(state.conn, row["email"]):
+                raise HTTPException(status_code=409, detail="仅同步账号库内状态正常的 Claude 账号")
+            scoped = workspace_store.find(state.conn, row["email"], "claude")
             if not row.get("session_key"):
                 raise HTTPException(status_code=400, detail=f"本地账号 {email} 没有 sessionKey")
             try:
                 row = await asyncio.to_thread(
                     oauth_acquire.acquire, state.conn, row["email"],
                     now=state.now_fn(), expect_email=email,
+                    **({"proxy_override": scoped["proxy"]} if scoped else {}),
                 )
             except OAuthError as exc:
                 log(f"sub2api 重新授权失败：#{account_id} {email}：{exc}")
                 raise HTTPException(status_code=422, detail=f"OAuth 授权失败：{exc}") from None
             try:
+                if not workspace_store.eligible_for_sync(state.conn, row["email"]):
+                    raise HTTPException(status_code=409, detail="账号状态已变化，未写回 sub2api")
                 updated = await asyncio.to_thread(c.apply_oauth, account_id, row)
             except Sub2APIError as exc:
                 log(f"sub2api 推送失败：#{account_id} {email}：{exc}")

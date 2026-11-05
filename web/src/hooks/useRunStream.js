@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 export function useRunStream() {
   const [activeRunId, setActiveRunId] = useState(null);
   const [activeStatus, setActiveStatus] = useState(null);
+  const [activePlatform, setActivePlatform] = useState(null);
   const [logLines, setLogLines] = useState([]);
   const [streamEpoch, setStreamEpoch] = useState(0);
   const esRef = useRef(null);
@@ -14,11 +15,12 @@ export function useRunStream() {
     };
   }, []);
 
-  const attach = useCallback((runId) => {
+  const attach = useCallback((runId, platform = null) => {
     if (esRef.current) esRef.current.close();
     setLogLines([]);
     setActiveRunId(runId);
     setActiveStatus("running");
+    setActivePlatform(platform);
     const es = new EventSource(`/api/runs/${runId}/stream`);
     esRef.current = es;
     es.addEventListener("log", (e) => {
@@ -36,5 +38,5 @@ export function useRunStream() {
     };
   }, []);
 
-  return { activeRunId, activeStatus, logLines, attach, streamEpoch };
+  return { activeRunId, activeStatus, activePlatform, logLines, attach, streamEpoch };
 }

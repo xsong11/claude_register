@@ -45,7 +45,7 @@ function MailItem({ mail }) {
         <div className="flex shrink-0 flex-col items-end gap-1 text-xs text-muted-foreground">
           <span>{fmtDate(mail.date)}</span>
           {mail.folder === "Junk" ? (
-            <Badge className="rounded-full border-transparent bg-amber-500/15 text-amber-400">
+            <Badge className="rounded-full border-transparent bg-amber-500/15 text-amber-800 dark:text-amber-400">
               垃圾邮件
             </Badge>
           ) : null}
@@ -141,7 +141,7 @@ export function MailDialog({ email, onOpenChange }) {
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-y-auto p-4">
           {error ? (
-            <p className="text-sm text-red-400">{error}</p>
+            <p className="text-sm text-destructive">{error}</p>
           ) : loading && !data ? (
             <p className="text-sm text-muted-foreground">正在读取邮件…</p>
           ) : data && mails.length === 0 ? (

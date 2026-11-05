@@ -6,31 +6,41 @@
 from __future__ import annotations
 
 from claude_register import okbrowser
-from claude_register.chatgpt_browser import CHATGPT_URL, extract_credentials
+from claude_register.chatgpt_browser import (
+    CHATGPT_URL, SESSION_URL, parse_auth_session, session_token_from_cookies,
+)
 from claude_register.chatgpt_check import check_chatgpt_session
 from claude_register.console import log
 from server import db
 
 
 def read_window_session(ws: str) -> dict:
-    """经 CDP 在窗口里新开一个标签页读取 chatgpt.com 会话；只断开连接，不关窗口。"""
-    from playwright.sync_api import sync_playwright
+    """Read the authenticated session in the bound browser, then its current cookie."""
+    from playwright.sync_api import Error, sync_playwright
 
-    playwright = sync_playwright().start()
-    try:
-        browser = playwright.chromium.connect_over_cdp(ws)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(ws, timeout=15_000)
+        if not browser.contexts:
+            return {}
+        context = browser.contexts[0]
         page = context.new_page()
         try:
-            page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60_000)
-            return extract_credentials(page, timeout_ms=10_000)
+            response = page.goto(SESSION_URL, wait_until="domcontentloaded", timeout=20_000)
+            if response is None or response.url != SESSION_URL or not response.ok:
+                return {}
+            try:
+                fields = parse_auth_session(response.json())
+            except ValueError:
+                return {}
+            if fields:
+                # The session request can refresh the cookie. Capture it after the response.
+                fields["chatgpt_session_token"] = session_token_from_cookies(context.cookies(CHATGPT_URL))
+            return fields
         finally:
             try:
                 page.close()
-            except Exception:  # noqa: BLE001
+            except Error:
                 pass
-    finally:
-        playwright.stop()
 
 
 def resync_from_window(conn, cfg, row: dict, now: str, *, client_factory=None,

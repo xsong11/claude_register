@@ -1,6 +1,7 @@
 """SQLite 数据访问：runs / accounts。纯数据层，无业务逻辑。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -27,6 +28,17 @@ CREATE TABLE IF NOT EXISTS openai_admin_keys (
   status TEXT, last_error TEXT,
   cost_month_usd REAL, cost_since_usd REAL, refreshed_at TEXT,
   created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS openai_project_snapshots (
+  admin_key_id INTEGER PRIMARY KEY,
+  payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS openai_project_secrets (
+  admin_key_id INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  api_key_id TEXT NOT NULL,
+  ciphertext BLOB NOT NULL,
+  PRIMARY KEY (admin_key_id, project_id, api_key_id)
 );
 """
 
@@ -98,6 +110,8 @@ def init_db(path: Path) -> sqlite3.Connection:
     _migrate_accounts(conn)
     _migrate_runs(conn)
     conn.commit()
+    from server import workspace_store
+    workspace_store.migrate(conn)
     return conn
 
 
@@ -125,7 +139,13 @@ def _row(r) -> dict | None:
     return dict(r) if r is not None else None
 
 
-def list_runs(conn, limit=50, offset=0) -> list[dict]:
+def list_runs(conn, limit=50, offset=0, *, platform=None) -> list[dict]:
+    if platform:
+        rows = conn.execute(
+            "SELECT * FROM runs WHERE COALESCE(platform,'claude') IN (?,'both') "
+            "ORDER BY id DESC LIMIT ? OFFSET ?", (platform, limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
     rows = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ? OFFSET ?",
                         (limit, offset)).fetchall()
     return [dict(r) for r in rows]
@@ -337,7 +357,12 @@ def normalize_group(name) -> str:
 def group_counts(conn) -> tuple[dict[str, int], int]:
     """返回 ({分组名: 账号数}, 未分组账号数)。"""
     rows = conn.execute(
-        "SELECT COALESCE(group_name,'') AS g, COUNT(*) AS n FROM accounts GROUP BY g"
+        """SELECT g,COUNT(*) AS n FROM (
+            SELECT group_name AS g FROM workspace_accounts
+            UNION ALL
+            SELECT COALESCE(a.group_name,'') AS g FROM accounts a
+            WHERE NOT EXISTS (SELECT 1 FROM workspace_accounts w WHERE w.email=a.email COLLATE BINARY)
+        ) GROUP BY g"""
     ).fetchall()
     counts = {r["g"]: r["n"] for r in rows}
     ungrouped = counts.pop("", 0)
@@ -375,9 +400,10 @@ def set_accounts_proxy(conn, emails, proxy: str) -> int:
 
 
 def rename_group(conn, old: str, new: str) -> int:
+    scoped = conn.execute("UPDATE workspace_accounts SET group_name=? WHERE group_name=?", (new, old))
     cur = conn.execute("UPDATE accounts SET group_name=? WHERE group_name=?", (new, old))
     conn.commit()
-    return cur.rowcount
+    return max(scoped.rowcount, cur.rowcount)
 
 
 def _group_where(group: str | None) -> tuple[list[str], list]:
@@ -389,7 +415,7 @@ def _group_where(group: str | None) -> tuple[list[str], list]:
 
 
 # 已知不可用的检测结果：领取时默认跳过
-UNUSABLE_CHECK_STATUSES = ("dead", "blocked")
+UNUSABLE_CHECK_STATUSES = ("dead", "blocked", "banned")
 _claim_lock = threading.Lock()
 
 # 平台 → (注册状态列, 凭据条件, 检测结果列, 已获取标记列)
@@ -409,8 +435,10 @@ def _claimable_where(check_status: str | None, platform: str = "claude",
     """可领取：注册成功、有凭据、未获取；check_status 为空时跳过已知失效/被拦截的，
     指定时只取该检测结果的账号。Claude 与 ChatGPT 各有一套状态与「已获取」标记。"""
     status_col, cred_cond, check_col, claimed_col = _CLAIM_COLUMNS[platform]
-    where = [f"{status_col}='success'", cred_cond, f"COALESCE({claimed_col},'')=''"]
-    params: list = []
+    where = [f"{status_col}='success'", cred_cond, f"COALESCE({claimed_col},'')=''",
+             "NOT EXISTS (SELECT 1 FROM workspace_accounts w WHERE w.email=accounts.email COLLATE BINARY "
+             "AND w.platform=? AND (w.stage<>'library' OR w.management_status<>'normal'))"]
+    params: list = [platform]
     if check_status:
         where.append(f"{check_col}=?")
         params.append(check_status)
@@ -420,9 +448,10 @@ def _claimable_where(check_status: str | None, platform: str = "claude",
             + ",".join("?" * len(UNUSABLE_CHECK_STATUSES)) + ")"
         )
         params.extend(UNUSABLE_CHECK_STATUSES)
-    gw, gp = _group_where(group)
-    where.extend(gw)
-    params.extend(gp)
+    if group:
+        where.append("COALESCE((SELECT w.group_name FROM workspace_accounts w WHERE "
+                     "w.email=accounts.email COLLATE BINARY AND w.platform=?),group_name,'')=?")
+        params.extend((platform, "" if group == UNGROUPED else group))
     return " AND ".join(where), params
 
 
@@ -448,13 +477,18 @@ def claim_account(conn, now, *, check_status: str | None = None, platform: str =
             return None
         cur = conn.execute(
             f"UPDATE accounts SET {claimed_col}=? "
-            f"WHERE rowid=? AND COALESCE({claimed_col},'')=''",
-            (now, row["rowid"]),
+            f"WHERE rowid=? AND {where}",
+            (now, row["rowid"], *params),
         )
         conn.commit()
         if cur.rowcount == 0:  # 理论上不会发生（锁内），保险起见
             return None
-        return get_account(conn, row["email"])
+        account = get_account(conn, row["email"])
+        from server.workspace_store import find
+        scoped = find(conn, row["email"], platform)
+        if scoped:
+            account.update(group_name=scoped["group_name"], proxy=scoped["proxy"])
+        return account
 
 
 def set_account_claimed(conn, email, claimed_at: str) -> bool:
@@ -522,12 +556,62 @@ def update_openai_key(conn, key_id, fields: dict) -> bool:
     if not sets:
         return False
     sql = "UPDATE openai_admin_keys SET " + ", ".join(f"{k}=?" for k in sets) + " WHERE id=?"
-    cur = conn.execute(sql, (*sets.values(), key_id))
-    conn.commit()
+    with conn:
+        cur = conn.execute(sql, (*sets.values(), key_id))
+        if cur.rowcount and "admin_key" in sets:
+            _clear_openai_projects(conn, key_id)
     return cur.rowcount > 0
 
 
 def delete_openai_key(conn, key_id) -> bool:
-    cur = conn.execute("DELETE FROM openai_admin_keys WHERE id=?", (key_id,))
-    conn.commit()
+    with conn:
+        cur = conn.execute("DELETE FROM openai_admin_keys WHERE id=?", (key_id,))
+        _clear_openai_projects(conn, key_id)
     return cur.rowcount > 0
+
+
+def _clear_openai_projects(conn, key_id) -> None:
+    conn.execute("DELETE FROM openai_project_snapshots WHERE admin_key_id=?", (key_id,))
+    conn.execute("DELETE FROM openai_project_secrets WHERE admin_key_id=?", (key_id,))
+
+
+def get_openai_project_snapshot(conn, key_id) -> dict | None:
+    row = conn.execute("SELECT payload FROM openai_project_snapshots WHERE admin_key_id=?", (key_id,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def put_openai_project_snapshot(conn, key_id, payload: dict) -> None:
+    conn.execute(
+        "INSERT INTO openai_project_snapshots(admin_key_id,payload) VALUES(?,?) "
+        "ON CONFLICT(admin_key_id) DO UPDATE SET payload=excluded.payload",
+        (key_id, json.dumps(payload, ensure_ascii=False)),
+    )
+
+
+def list_openai_project_secret_refs(conn, key_id) -> set[tuple[str, str]]:
+    return {tuple(row) for row in conn.execute(
+        "SELECT project_id,api_key_id FROM openai_project_secrets WHERE admin_key_id=?", (key_id,),
+    )}
+
+
+def get_openai_project_secret(conn, key_id, project_id, api_key_id) -> bytes | None:
+    row = conn.execute(
+        "SELECT ciphertext FROM openai_project_secrets WHERE admin_key_id=? AND project_id=? AND api_key_id=?",
+        (key_id, project_id, api_key_id),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def put_openai_project_secret(conn, key_id, project_id, api_key_id, ciphertext: bytes) -> None:
+    conn.execute(
+        "INSERT INTO openai_project_secrets(admin_key_id,project_id,api_key_id,ciphertext) VALUES(?,?,?,?) "
+        "ON CONFLICT(admin_key_id,project_id,api_key_id) DO UPDATE SET ciphertext=excluded.ciphertext",
+        (key_id, project_id, api_key_id, ciphertext),
+    )
+
+
+def delete_openai_project_secret(conn, key_id, project_id, api_key_id) -> None:
+    conn.execute(
+        "DELETE FROM openai_project_secrets WHERE admin_key_id=? AND project_id=? AND api_key_id=?",
+        (key_id, project_id, api_key_id),
+    )

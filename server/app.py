@@ -32,7 +32,7 @@ from claude_register.session_check import check_session_with_org, probe_session
 from claude_register.xui import XuiClient
 from server import (
     auth, chatgpt_resync, db, export, mail_view, oauth_acquire, okbrowser_ops, open_api,
-    openai_admin, sk_import, sub2api,
+    openai_admin, sk_import, sub2api, workspaces,
 )
 from server.config_store import save_config, to_dict
 from server.deps import AppState, default_now
@@ -246,8 +246,10 @@ def create_app(*, data_dir, config_path, now_fn=None) -> FastAPI:
         )
 
     @app.get("/api/runs")
-    def get_runs(limit: int = 50, offset: int = 0, _=Depends(require_auth)):
-        return db.list_runs(state.conn, limit, offset)
+    def get_runs(limit: int = 50, offset: int = 0, platform: str | None = None, _=Depends(require_auth)):
+        if platform not in (None, "claude", "chatgpt"):
+            raise HTTPException(400, "请选择 Claude 或 ChatGPT")
+        return db.list_runs(state.conn, limit, offset, platform=platform)
 
     @app.get("/api/runs/{run_id}")
     def run_detail(run_id: int, _=Depends(require_auth)):
@@ -1153,6 +1155,7 @@ def create_app(*, data_dir, config_path, now_fn=None) -> FastAPI:
     )
     sub2api.register_sub2api_routes(app, state, require_auth=require_auth)
     openai_admin.register_openai_routes(app, state, require_auth=require_auth)
+    workspaces.register_routes(app, state, require_auth, start_registration)
 
     # 前端（dist 存在才挂，测试环境无 dist 不报错）
     if WEB_DIST.exists():

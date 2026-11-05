@@ -48,7 +48,7 @@ def inject_cookies(ws: str, cookies: list[dict], url: str) -> None:
 
 
 def open_window(conn, cfg, row: dict, *, create_if_missing: bool = True,
-                client_factory=None, inject=None) -> dict:
+                client_factory=None, inject=None, platform=None) -> dict:
     """打开账号绑定的窗口；未绑定且允许 create_if_missing 时新建、落库并注入 Cookie。"""
     client = _client(cfg, client_factory)
     window_id = str(row.get("okbrowser_window_id") or "")
@@ -62,16 +62,34 @@ def open_window(conn, cfg, row: dict, *, create_if_missing: bool = True,
         created = True
         db.update_account_fields(conn, row["email"], {"okbrowser_window_id": window_id})
         log(f"已为 {row['email']} 新建并绑定 OKBrowser 窗口：{window_id}")
-    else:
+    elif not platform or not okbrowser.running_ws(window_id):
         client.update_proxy(window_id, proxy)
     ws = client.start(window_id)
+    # A bound profile may already hold a newer login than the database.
     cookies = account_cookies(row) if created else []
     if cookies:
         try:
-            (inject or inject_cookies)(ws, cookies, _landing_url(row))
+            url = "https://chatgpt.com/" if platform == "chatgpt" else _landing_url(row)
+            (inject or inject_cookies)(ws, cookies, url)
         except Exception as exc:  # noqa: BLE001
             log(f"? OKBrowser ?????? Cookie ???{exc}????????")
     return {"ok": True, "window_id": window_id, "ws": ws, "created": created}
+
+
+def read_bound_session(cfg, window_id: str, reader, *, client_factory=None):
+    """Read the bound profile without changing its proxy, cookies or existing tabs."""
+    ws = okbrowser.running_ws(window_id)
+    if ws:
+        return reader(ws)
+    client = _client(cfg, client_factory)
+    ws = client.start(window_id)
+    try:
+        return reader(ws)
+    finally:
+        try:
+            client.close(window_id)
+        except OkBrowserError:
+            log(f"本次同步启动的 OKBrowser 窗口 {window_id} 未能自动关闭。")
 
 
 def close_window(cfg, window_id: str, *, client_factory=None) -> None:

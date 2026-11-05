@@ -406,6 +406,36 @@ def test_panel_start_without_window_and_no_create_is_502(panel):
     assert r.status_code == 502
 
 
+def test_scoped_open_does_not_replace_session_in_existing_window(panel, monkeypatch):
+    from server import db, okbrowser_ops
+    from server.config_store import Config
+
+    _, conn, injected = panel
+    db.update_account_fields(conn, "a@x.com", {"okbrowser_window_id": "bound"})
+    monkeypatch.setattr(okbrowser, "running_ws", lambda _: "ws://existing")
+    row = db.get_account(conn, "a@x.com")
+    result = okbrowser_ops.open_window(conn, Config(), row, platform="claude")
+    assert result["created"] is False and not injected
+    assert ("start", "bound") in _Okb.calls
+    assert not any(call[0] == "update_proxy" for call in _Okb.calls)
+
+
+def test_read_bound_session_reuses_active_profile_and_closes_only_its_own(panel, monkeypatch):
+    from server import okbrowser_ops
+    from server.config_store import Config
+
+    monkeypatch.setattr(okbrowser, "running_ws", lambda wid: "ws://open" if wid == "active" else "")
+    assert okbrowser_ops.read_bound_session(Config(), "active", lambda ws: ws) == "ws://open"
+    assert not _Okb.calls
+    with pytest.raises(ValueError):
+        def bad_reader(ws):
+            assert ws == "ws://stopped"
+            raise ValueError("no session")
+
+        okbrowser_ops.read_bound_session(Config(), "stopped", bad_reader)
+    assert [call[0] for call in _Okb.calls] == ["init", "start", "close"]
+
+
 def test_panel_close_unbind_and_delete(panel):
     from server import db
 

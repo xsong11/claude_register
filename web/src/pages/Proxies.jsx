@@ -156,7 +156,7 @@ export default function Proxies() {
                       <b>{p.name}</b>
                       {r && (
                         r.ok ? (
-                          <Badge className="rounded-full border-transparent bg-emerald-500/15 text-emerald-400">
+                          <Badge className="rounded-full border-transparent bg-emerald-500/15 text-emerald-800 dark:text-emerald-400">
                             连通 · {r.ip}
                             {r.country ? ` (${[r.country, r.city].filter(Boolean).join(" ")})` : ""}
                             {r.timezone ? ` · ${r.timezone}` : ""}
@@ -164,7 +164,7 @@ export default function Proxies() {
                           </Badge>
                         ) : (
                           <Badge
-                            className="rounded-full border-transparent bg-red-500/15 text-red-400"
+                            className="rounded-full border-transparent bg-red-500/15 text-red-700 dark:text-red-400"
                             title={r.detail || ""}
                           >
                             不通 · {r.detail || "连接失败"}

@@ -9,8 +9,8 @@ import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 
 const STATUS = {
-  active: ["正常", "bg-emerald-500/15 text-emerald-400"],
-  error: ["异常", "bg-red-500/15 text-red-400"],
+  active: ["正常", "bg-emerald-500/15 text-emerald-800 dark:text-emerald-400"],
+  error: ["异常", "bg-red-500/15 text-red-700 dark:text-red-400"],
   disabled: ["已停用", "bg-muted text-muted-foreground"],
 };
 
@@ -24,7 +24,7 @@ const FILTERS = [
 const LIVE = { alive: "有效", dead: "失效", blocked: "被拦截", error: "检测失败" };
 
 function canFix(a) {
-  return !!a.local?.has_session_key;
+  return !!a.local?.has_session_key && a.local.eligible_for_sync !== false;
 }
 
 function matchFilter(a, filter) {
@@ -51,7 +51,7 @@ function TokenExpiry({ iso }) {
   if (!iso) return null;
   const expired = new Date(iso).getTime() <= Date.now();
   return (
-    <span className={expired ? "text-red-400" : ""} title={iso}>
+    <span className={expired ? "text-destructive" : ""} title={iso}>
       令牌{expired ? "已过期" : "过期"} {fmtTime(iso)}
     </span>
   );
@@ -179,7 +179,7 @@ export default function Sub2API({ navigate }) {
         </p>
         {error && (
           <Alert className="border-red-500/30 bg-red-500/10">
-            <AlertDescription className="flex w-full items-center justify-between gap-2 text-red-400">
+            <AlertDescription className="flex w-full items-center justify-between gap-2 text-destructive">
               <span>{error}</span>
               {/未配置/.test(error) && (
                 <Button variant="outline" size="sm" onClick={() => navigate("settings")}>
@@ -266,13 +266,13 @@ export default function Sub2API({ navigate }) {
                           {a.local.has_session_key ? "" : " · 无 sessionKey"}
                         </span>
                       ) : (
-                        <span className="text-amber-400">
+                        <span className="text-amber-800 dark:text-amber-400">
                           {a.email ? `本地没有 ${a.email}` : "无法识别邮箱"}
                         </span>
                       )}
                     </span>
                     {a.error_message ? (
-                      <span className="truncate text-xs text-red-400/90" title={a.error_message}>
+                      <span className="truncate text-xs text-destructive" title={a.error_message}>
                         {a.error_message}
                       </span>
                     ) : null}
@@ -282,7 +282,7 @@ export default function Sub2API({ navigate }) {
                     size="sm"
                     className="shrink-0"
                     disabled={!canFix(a) || busy.has(a.id) || !!batch}
-                    title={canFix(a) ? "用本地 sessionKey 重新授权并写回 sub2api" : "本地没有可用的 sessionKey"}
+                    title={canFix(a) ? "用本地 sessionKey 重新授权并写回 sub2api" : "需要账号库内状态正常且有 sessionKey 的 Claude 账号"}
                     onClick={() => reauth(a)}
                   >
                     {busy.has(a.id) ? "授权中…" : "重新授权"}

@@ -48,7 +48,7 @@ function GroupRow({ group, busy, onRename, onDelete }) {
       <Button
         variant="outline"
         size="sm"
-        className="h-8 text-red-400 hover:text-red-300"
+        className="h-8 text-red-700 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300"
         aria-label={`删除分组 ${group.name}`}
         disabled={busy}
         onClick={() => onDelete(group)}

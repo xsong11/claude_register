@@ -22,7 +22,31 @@ const j = async (r) => {
   return r.json();
 };
 
+const ws = (platform) => `/api/workspaces/${encodeURIComponent(platform)}`;
+const wsRecord = (platform, id) => `${ws(platform)}/record/${id}`;
+const send = (url, method, body) => fetch(url, {
+  method,
+  cache: "no-store",
+  headers: { "content-type": "application/json" },
+  body: body == null ? undefined : JSON.stringify(body),
+}).then(j);
+
 export const api = {
+  workspace: (platform, stage) => fetch(`${ws(platform)}/${stage}`, { cache: "no-store" }).then(j),
+  workspaceDetail: (platform, id, signal) => fetch(wsRecord(platform, id), { cache: "no-store", signal }).then(j),
+  workspaceEdit: (platform, id, body) => send(wsRecord(platform, id), "PATCH", body),
+  workspaceRecordAction: (platform, id, action, body) => send(`${wsRecord(platform, id)}/${action}`, "POST", body),
+  workspaceImport: (platform, stage, body) => send(`${ws(platform)}/${stage}/import`, "POST", body),
+  workspaceBatch: (platform, stage, body) => send(`${ws(platform)}/${stage}/batch`, "POST", body),
+  workspaceExport: async (platform, stage, body) => {
+    const res = await fetch(`${ws(platform)}/${stage}/batch`, {
+      method: "POST", cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, action: "export" }),
+    });
+    if (!res.ok) return j(res);
+    return res.blob();
+  },
   login: (password) =>
     fetch("/api/login", {
       method: "POST",
@@ -119,7 +143,7 @@ export const api = {
       cache: "no-store",
     }).then(j),
 
-  listRuns: () => fetch("/api/runs").then(j),
+  listRuns: (platform) => fetch(platform ? `/api/runs?${new URLSearchParams({ platform })}` : "/api/runs").then(j),
 
   runDetail: (id) => fetch(`/api/runs/${id}`).then(j),
 
@@ -230,7 +254,12 @@ export const api = {
 
   openaiKeyRefresh: (id) => fetch(`/api/openai/keys/${id}/refresh`, { method: "POST" }).then(j),
 
-  openaiProjectKeys: (id) => fetch(`/api/openai/keys/${id}/api-keys`).then(j),
+  openaiProjectKeys: (id) => fetch(`/api/openai/keys/${id}/api-keys`, { cache: "no-store" }).then(j),
+
+  openaiProjectKeysRefresh: (id) => send(`/api/openai/keys/${id}/api-keys/refresh`, "POST"),
+
+  openaiProjectKeyCopy: (id, projectId, keyId) =>
+    send(`/api/openai/keys/${id}/api-keys/${encodeURIComponent(keyId)}/copy?${new URLSearchParams({ project_id: projectId })}`, "POST"),
 
   openaiProjectKeyCreate: (id, projectId, name) =>
     fetch(`/api/openai/keys/${id}/api-keys`, {

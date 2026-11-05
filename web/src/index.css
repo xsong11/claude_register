@@ -5,6 +5,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  color-scheme: light;
   --radius: 0.625rem;
   --background: oklch(0.975 0.012 255);
   --foreground: oklch(0.141 0.005 285.823);
@@ -17,24 +18,25 @@
   --secondary: oklch(0.967 0.001 286.375);
   --secondary-foreground: oklch(0.21 0.006 285.885);
   --muted: oklch(0.967 0.001 286.375);
-  --muted-foreground: oklch(0.552 0.016 285.938);
+  --muted-foreground: oklch(0.49 0.016 285.938);
   --accent: oklch(0.967 0.001 286.375);
   --accent-foreground: oklch(0.21 0.006 285.885);
   --destructive: oklch(0.577 0.245 27.325);
   --border: oklch(0.92 0.004 286.32);
   --input: oklch(0.92 0.004 286.32);
   --ring: oklch(0.705 0.015 286.067);
-  --sidebar: hsl(224 34% 12%);
-  --sidebar-foreground: hsl(220 20% 92%);
-  --sidebar-primary: hsl(204 94% 58%);
-  --sidebar-primary-foreground: hsl(0 0% 98%);
-  --sidebar-accent: hsl(223 28% 20%);
-  --sidebar-accent-foreground: hsl(240 5.9% 10%);
-  --sidebar-border: hsl(220 13% 91%);
-  --sidebar-ring: hsl(217.2 91.2% 59.8%);
+  --sidebar: oklch(0.99 0.003 255);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: oklch(0.95 0.02 255);
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.141 0.005 285.823);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.21 0.006 285.885);
@@ -107,10 +109,10 @@
   }
 }
 
-.app-shell { background: radial-gradient(circle at 50% -10%, oklch(1 0 0 / .8), transparent 34rem); }
-.brand { font-family: "Space Grotesk", sans-serif; letter-spacing: -.02em; color: #f4f7ff; }
+.app-shell { background: radial-gradient(circle at 50% -10%, color-mix(in oklab, var(--primary) 9%, transparent), transparent 34rem); }
+.brand { font-family: "Space Grotesk", sans-serif; letter-spacing: -.02em; color: var(--sidebar-foreground); }
 .brand-mark { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 9px; color: white; background: linear-gradient(135deg, #42b8ff, #6757f5); box-shadow: 0 5px 18px #3a7cff55; }
-.brand-subtitle { display: block; margin: 7px 0 0 36px; color: #95a5c2; font: 500 10px "DM Sans", sans-serif; letter-spacing: .08em; }
+.brand-subtitle { display: block; margin: 7px 0 0 36px; color: var(--muted-foreground); font: 500 10px "DM Sans", sans-serif; letter-spacing: .08em; }
 .app-content > * { animation: rise-in .28s ease-out both; }
 .loading-mark { display: flex; gap: .5rem; align-items: center; color: var(--muted-foreground); font-size: .9rem; }
 .loading-mark svg { color: var(--primary); animation: pulse 1.5s infinite; }

@@ -31,7 +31,7 @@ def unix_from_iso(text: str) -> int:
 
 
 def acquire(conn, email: str, *, now: str, authorize=None,
-            expect_email: str | None = None) -> dict:
+            expect_email: str | None = None, proxy_override: str | None = None) -> dict:
     """为账号获取 OAuth 令牌并写库；返回更新后的账号行。
 
     账号不存在抛 AccountNotFound；授权失败抛 oauth.OAuthError，
@@ -44,7 +44,8 @@ def acquire(conn, email: str, *, now: str, authorize=None,
         raise AccountNotFound(email)
     authorize = authorize or oauth.authorize_with_session_key
     try:
-        tokens = authorize(row.get("session_key") or "", row.get("proxy") or None)
+        proxy = row.get("proxy") if proxy_override is None else proxy_override
+        tokens = authorize(row.get("session_key") or "", proxy or None)
     except oauth.OAuthError as exc:
         if exc.kind == "dead":
             db.update_account_check(conn, email, "dead", now)
