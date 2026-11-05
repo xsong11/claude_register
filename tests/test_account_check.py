@@ -44,17 +44,30 @@ def test_account_check_404_on_missing_account(tmp_path):
 
 def test_account_check_alive(tmp_path):
     app, c = _client(tmp_path)
-    with mock.patch("server.app.check_session", return_value=("alive", "有效")):
+    with mock.patch("server.app.check_session_with_org",
+                    return_value=("alive", "有效", "org-123")):
         r = c.post("/api/accounts/a@x.com/check")
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "alive"
     assert body["detail"] == "有效"
     assert body["checked_at"]
+    assert body["org_uuid"] == "org-123"
 
     row = db.get_account(app.state.cr.conn, "a@x.com")
     assert row["check_status"] == "alive"
     assert row["checked_at"] == body["checked_at"]
+    assert row["org_uuid"] == "org-123"
+
+
+def test_account_check_dead_keeps_existing_org(tmp_path):
+    app, c = _client(tmp_path)
+    db.update_account_org(app.state.cr.conn, "a@x.com", "org-old")
+    with mock.patch("server.app.check_session_with_org",
+                    return_value=("dead", "已失效（HTTP 403）", "")):
+        r = c.post("/api/accounts/a@x.com/check")
+    assert r.json()["org_uuid"] == "org-old"
+    assert db.get_account(app.state.cr.conn, "a@x.com")["org_uuid"] == "org-old"
 
 
 def test_account_check_requires_auth(tmp_path):

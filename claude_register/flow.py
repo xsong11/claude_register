@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from claude_register.anymail import AnyMailClient, Mailbox, load_dotenv
 from claude_register.accounts import AccountRecord, save_account_record
+from claude_register.outlook import (
+    OUTLOOK_MAIL_URL,
+    OutlookClient,
+    is_outlook_credentials,
+    parse_outlook_line,
+)
 from claude_register.browser import (
+    PhoneVerificationRequired,
     _output_dir,
     browser_session,
     default_display_name,
@@ -24,7 +31,8 @@ from claude_register.browser import (
 from typing import TYPE_CHECKING
 
 from claude_register.console import banner, log
-from claude_register.mailbox import prepare_mailbox
+from claude_register.mailbox import prepare_mailbox, utc_now_iso
+from claude_register.okbrowser import OkBrowserClient, OkBrowserSettings
 from claude_register.proxy_pool import ProvisionedProxy, ProxyPool, XuiNode
 
 if TYPE_CHECKING:
@@ -68,16 +76,25 @@ def run_browser(
     poll_client: AnyMailClient | None = None,
     mail_key: str = "",
     proxy_meta: dict | None = None,
+    okbrowser: OkBrowserSettings | None = None,
+    okbrowser_window_id: str = "",
 ) -> dict | None:
     """跑浏览器登录/建号。成功拿到 sessionKey 时返回账号 dict，否则 None。
 
     poll_client：接码轮询用的客户端（子 key）；None 时回落用 client（父 key）。
     mail_key：随账号导出的子 key 明文；降级时空串，父 key 绝不写进导出。
     proxy_meta：3x-ui 专属代理的 {node, inbound_id, expiry_ms}；随账号写入 extra["xui"]。
+    okbrowser：非 None 时用 OKBrowser 指纹窗口代替内置 Chromium。
+    okbrowser_window_id：账号已绑定的 OKBrowser 窗口，优先复用。
+
+    用了 OKBrowser 时返回的 dict 带 okbrowser_window_id（窗口被删除时为空串）；
+    没拿到 sessionKey 但窗口保留了，也返回只含邮箱与窗口 ID 的 dict，方便人工接着处理。
     """
     poll = poll_client or client
     account: dict | None = None
+    phone_required = False
     display_name = default_display_name(mailbox.email)
+    window = WindowTracker(okbrowser_window_id)
 
     def _capture(page) -> dict | None:
         nonlocal account
@@ -98,6 +115,7 @@ def run_browser(
             mailbox_id=str(mailbox.id or ""),
             mail_key=mail_key,
             mail_base_url=client.base_url if mail_key else "",
+            okbrowser_window_id=window.window_id,
             extra={"xui": proxy_meta} if proxy_meta else {},
         )
         paths = save_account_record(record, output_dir=_output_dir.get())
@@ -106,7 +124,8 @@ def run_browser(
         banner(f"账号已保存：{mailbox.email}")
         return account
 
-    with browser_session(proxy=proxy) as browser:
+    with browser_session(proxy=proxy, okbrowser=okbrowser, name=mailbox.email,
+                         window_id=okbrowser_window_id, on_window=window) as browser:
         context, page = new_page(browser)
         try:
             open_login(page)
@@ -186,6 +205,9 @@ def run_browser(
                     log("既没收到登录链接，也没收到验证码。")
                     screenshot(page, "no_mail.png")
                     _report_manual_fallback(mailbox, poll)
+            except PhoneVerificationRequired:
+                phone_required = True
+                banner("需要手机号验证，已停止本次注册")
             except Exception as exc:
                 # 到这一步，链接/验证码已经从邮箱里取出来了——而且不能重新获取
                 # （魔术链接一次性；邮箱不会再收到新邮件）。哪怕这里的收尾动作
@@ -208,7 +230,46 @@ def run_browser(
                 # 让外层 run() 误判成「未保存」而去撤销刚导出的子 key。
                 log(f"关闭浏览器上下文出错（{exc}），忽略。")
             # browser 的关闭交给 browser_session 的上下文退出，这里不重复关。
+    if account is None and (phone_required or window.kept):
+        # 不带 sessionKey；AnyMail 子 key 随后会被撤销，所以只有 Outlook 凭据值得回写。
+        outlook = client.base_url == OUTLOOK_MAIL_URL
+        account = {
+            "email": mailbox.email,
+            "password": password or "",
+            "mail_key": mail_key if outlook else "",
+            "mail_base_url": OUTLOOK_MAIL_URL if outlook else "",
+        }
+        if phone_required:
+            account["phone_required"] = True
+    if account is not None and window.reported:
+        account["okbrowser_window_id"] = window.window_id
     return account
+
+
+class WindowTracker:
+    """作为 browser_session 的 on_window 回调，记下最终使用/保留的 OKBrowser 窗口。"""
+
+    def __init__(self, initial: str = ""):
+        self.window_id = (initial or "").strip()
+        self.reported = False
+
+    def __call__(self, window_id: str) -> None:
+        self.window_id = window_id or ""
+        self.reported = True
+
+    @property
+    def kept(self) -> bool:
+        return self.reported and bool(self.window_id)
+
+
+def _okbrowser_settings(config: "Config | None") -> OkBrowserSettings | None:
+    if config is None or getattr(config, "browser_mode", "chromium") != "okbrowser":
+        return None
+    return OkBrowserSettings(
+        api_url=config.okbrowser_api_url,
+        group_id=(config.okbrowser_group_id or "").strip(),
+        delete_after=config.okbrowser_delete_after,
+    )
 
 
 def _build_proxy_pool(config: "Config") -> ProxyPool | None:
@@ -231,18 +292,26 @@ def run(
     code_timeout: float = 120.0,
     config: Config | None = None,
     password: str = "",
+    mail_key: str = "",
+    mail_base_url: str = "",
+    okbrowser_window_id: str = "",
 ) -> dict | None:
     load_dotenv()
+    if email:
+        parsed_line = parse_outlook_line(email)
+        if parsed_line is not None:
+            email = parsed_line.email
+            password = password or parsed_line.password
+            mail_key = mail_key or parsed_line.mail_key
+            mail_base_url = mail_base_url or OUTLOOK_MAIL_URL
+
     if email and domain:
         log("已指定 --email，忽略 --domain（邮箱已含后缀）。")
 
+    use_outlook = bool(email and is_outlook_credentials(mail_base_url, mail_key))
+    code_regex = (config.register_code_regex or None) if config is not None else None
+
     if config is not None:
-        client = AnyMailClient(
-            base_url=config.anymail_base_url or None,
-            api_key=config.anymail_api_key or None,
-            domain=config.anymail_domain or domain,
-            code_regex=config.register_code_regex or None,
-        )
         expires_hours = (
             None if config.anymail_expires_hours <= 0 else config.anymail_expires_hours
         )
@@ -250,9 +319,25 @@ def run(
         code_timeout = config.register_login_timeout
         proxy = config.register_proxy or None
     else:
-        client = AnyMailClient(domain=domain)
         expires_hours = None
         proxy = None
+
+    if use_outlook:
+        client = OutlookClient.from_credentials(
+            email=email or "",
+            mail_key=mail_key,
+            mail_base_url=mail_base_url,
+            code_regex=code_regex,
+        )
+    elif config is not None:
+        client = AnyMailClient(
+            base_url=config.anymail_base_url or None,
+            api_key=config.anymail_api_key or None,
+            domain=config.anymail_domain or domain,
+            code_regex=code_regex,
+        )
+    else:
+        client = AnyMailClient(domain=domain)
 
     pool = _build_proxy_pool(config) if config is not None else None
     if pool is None:
@@ -262,10 +347,21 @@ def run(
         # 之类的问题，那时邮箱已经建出来了。这里把两层校验都跑一遍。
         validate_proxy(proxy)
 
-    mailbox, since = prepare_mailbox(
-        client, email=email, domain=domain, expires_hours=expires_hours
-    )
-    log(f"本次邮箱：{mailbox.email} (id={mailbox.id or 'new'})")
+    okbrowser = _okbrowser_settings(config)
+    if okbrowser is not None:
+        # 建邮箱之前先确认客户端在线，免得白建一个 AnyMail 邮箱。
+        OkBrowserClient(okbrowser.api_url).status()
+        log(f"浏览器：OKBrowser 指纹窗口（{okbrowser.api_url}）")
+
+    if use_outlook:
+        since = utc_now_iso()
+        mailbox = Mailbox(id="", email=client.email)
+        log(f"使用 Outlook 邮箱（OAuth2 + IMAP）：{mailbox.email}")
+    else:
+        mailbox, since = prepare_mailbox(
+            client, email=email, domain=domain, expires_hours=expires_hours
+        )
+        log(f"本次邮箱：{mailbox.email} (id={mailbox.id or 'new'})")
 
     provisioned: ProvisionedProxy | None = None
     if pool is not None:
@@ -274,20 +370,27 @@ def run(
         log(f"已在节点 {provisioned.node_name} 开专属 socks5"
             f"（inbound={provisioned.inbound_id}）。")
 
-    child = client.create_child_key(
-        email=mailbox.email, expires_at=mailbox.expires_at
-    )
-    if child:
-        poll_client = AnyMailClient(
-            base_url=client.base_url,
-            api_key=child.plaintext,
-            domain=client.domain or None,
-            code_regex=client.code_regex or None,
-            timeout=client.timeout,
-        )
-        log("已派生本邮箱专用子 key（仅 emails:read），接码轮询改用子 key。")
-    else:
+    child = None
+    if use_outlook:
         poll_client = client
+        saved_mail_key = client.mail_key
+    else:
+        child = client.create_child_key(
+            email=mailbox.email, expires_at=mailbox.expires_at
+        )
+        if child:
+            poll_client = AnyMailClient(
+                base_url=client.base_url,
+                api_key=child.plaintext,
+                domain=client.domain or None,
+                code_regex=client.code_regex or None,
+                timeout=client.timeout,
+            )
+            log("已派生本邮箱专用子 key（仅 emails:read），接码轮询改用子 key。")
+            saved_mail_key = child.plaintext
+        else:
+            poll_client = client
+            saved_mail_key = mail_key or ""
 
     try:
         account = run_browser(
@@ -299,7 +402,7 @@ def run(
             proxy=proxy,
             password=password,
             poll_client=poll_client,
-            mail_key=child.plaintext if child else "",
+            mail_key=saved_mail_key,
             proxy_meta=(
                 {
                     "node": provisioned.node_name,
@@ -309,6 +412,8 @@ def run(
                 if provisioned
                 else None
             ),
+            okbrowser=okbrowser,
+            okbrowser_window_id=okbrowser_window_id if okbrowser is not None else "",
         )
     except BaseException:
         # run_browser 抛异常时这里拿不到它内部的 account 变量，没有轻量通道能
@@ -342,8 +447,11 @@ def run(
     if account and account.get("sessionKey"):
         sk = str(account["sessionKey"])
         log(f"sessionKey：{sk[:16]}…（共 {len(sk)} 字符，已写入 accounts 文件）")
+    elif account and account.get("phone_required"):
+        log("未保存 sessionKey：Claude 要求手机号验证，请换代理后重跑。")
     else:
         log("未保存 sessionKey（登录/建号可能未完成）。")
-    log("提示：邮箱默认永久保留；若显式设置了正数有效期，到期会被 AnyMail 清理。")
+    if not use_outlook:
+        log("提示：邮箱默认永久保留；若显式设置了正数有效期，到期会被 AnyMail 清理。")
     # Claude 魔术链接注册无独立密码；password 字段默认空，仅作导出占位。
     return account

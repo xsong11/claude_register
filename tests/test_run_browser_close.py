@@ -55,7 +55,7 @@ def _wire_common(monkeypatch, *, ctx):
     monkeypatch.setattr(flow, "save_account_record", fake_save)
 
     @contextmanager
-    def fake_browser_session(proxy=None):
+    def fake_browser_session(proxy=None, **kw):
         yield "BROWSER"
 
     monkeypatch.setattr(flow, "browser_session", fake_browser_session)

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Play, Users, Server, Settings as SettingsIcon, Sparkles, LogOut, KeyRound } from "lucide-react";
+import { Play, Users, Server, Settings as SettingsIcon, Sparkles, LogOut, KeyRound, Wallet } from "lucide-react";
 import { toast } from "sonner";
 import { api, SESSION_EXPIRED_EVENT } from "./api.js";
 import { useRunStream } from "./hooks/useRunStream.js";
@@ -14,6 +14,9 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
   SidebarProvider,
   SidebarRail,
   SidebarTrigger,
@@ -25,11 +28,13 @@ import Nodes from "./pages/Nodes.jsx";
 import Proxies from "./pages/Proxies.jsx";
 import Settings from "./pages/Settings.jsx";
 import Sub2API from "./pages/Sub2API.jsx";
+import OpenAI from "./pages/OpenAI.jsx";
 
 const NAV = [
   { key: "register", label: "注册任务", description: "创建与监控自动化任务", Icon: Play },
   { key: "accounts", label: "账号管理", description: "查看账号状态与凭据", Icon: Users },
   { key: "sub2api", label: "sub2api 同步", description: "重新授权并写回 sub2api", Icon: KeyRound },
+  { key: "openai", label: "OpenAI", description: "Admin Key 费用、剩余额度与项目 Key", Icon: Wallet },
   { key: "proxies", label: "代理池", description: "管理网络出口", Icon: Server },
   { key: "nodes", label: "节点设置", description: "配置 3x-ui 节点", Icon: Server },
   { key: "settings", label: "系统设置", description: "调整面板与注册参数", Icon: SettingsIcon },
@@ -37,9 +42,41 @@ const NAV = [
 
 const VIEW_KEYS = NAV.map((n) => n.key);
 
-function viewFromHash() {
-  const v = window.location.hash.replace(/^#\/?/, "");
-  return VIEW_KEYS.includes(v) ? v : "register";
+const UNGROUPED = "__ungrouped__";
+
+function parseHash() {
+  const [path, qs = ""] = window.location.hash.replace(/^#\/?/, "").split("?");
+  return {
+    view: VIEW_KEYS.includes(path) ? path : "register",
+    group: new URLSearchParams(qs).get("group") || "",
+  };
+}
+
+function AccountGroupNav({ groups, active, onPick }) {
+  const total = groups.groups.reduce((n, g) => n + g.count, 0) + groups.ungrouped_count;
+  const items = [
+    ["", "全部账号", total],
+    ...groups.groups.map((g) => [g.name, g.name, g.count]),
+    ...(groups.ungrouped_count && groups.groups.length ? [[UNGROUPED, "未分组", groups.ungrouped_count]] : []),
+  ];
+  return (
+    <SidebarMenuSub>
+      {items.map(([value, label, count]) => (
+        <SidebarMenuSubItem key={value || "__all__"}>
+          <SidebarMenuSubButton
+            asChild
+            size="sm"
+            isActive={active === value}
+          >
+            <button type="button" className="w-full" title={label} onClick={() => onPick(value)}>
+              <span className={value === UNGROUPED ? "text-muted-foreground" : ""}>{label}</span>
+              <span className="ml-auto text-[11px] text-muted-foreground tabular-nums">{count}</span>
+            </button>
+          </SidebarMenuSubButton>
+        </SidebarMenuSubItem>
+      ))}
+    </SidebarMenuSub>
+  );
 }
 
 export default function App() {
@@ -59,8 +96,14 @@ function AppBody() {
   authedRef.current = authed;
   // 引导态：服务端还没设面板密码，只能去设置页设密码，其余接口全 401。
   const [bootstrap, setBootstrap] = useState(false);
-  const [view, setView] = useState(viewFromHash);
+  const [route, setRoute] = useState(parseHash);
+  const view = route.view;
+  const [groups, setGroups] = useState({ groups: [], ungrouped_count: 0 });
   const runStream = useRunStream();
+
+  useEffect(() => {
+    if (authed && !bootstrap) api.listGroups().then(setGroups).catch(() => {});
+  }, [authed, bootstrap]);
 
   useEffect(() => {
     api
@@ -89,13 +132,19 @@ function AppBody() {
   }, []);
 
   useEffect(() => {
-    const onHash = () => setView(viewFromHash());
+    const onHash = () => setRoute(parseHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   function navigate(next) {
     window.location.hash = `#/${next}`;
+  }
+
+  function navigateGroup(group) {
+    window.location.hash = group
+      ? `#/accounts?${new URLSearchParams({ group })}`
+      : "#/accounts";
   }
 
   async function logout() {
@@ -172,6 +221,13 @@ function AppBody() {
                     <Icon />
                     <span>{label}</span>
                   </SidebarMenuButton>
+                  {key === "accounts" && groups.groups.length > 0 && (
+                    <AccountGroupNav
+                      groups={groups}
+                      active={view === "accounts" ? route.group : null}
+                      onPick={navigateGroup}
+                    />
+                  )}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>
@@ -199,9 +255,13 @@ function AppBody() {
               attach={runStream.attach}
               running={runStream.activeStatus === "running"}
               navigate={navigate}
+              group={route.group}
+              onGroupChange={navigateGroup}
+              onGroupsLoaded={setGroups}
             />
           )}
           {view === "sub2api" && <Sub2API navigate={navigate} />}
+          {view === "openai" && <OpenAI />}
           {view === "proxies" && <Proxies />}
           {view === "nodes" && <Nodes />}
           {view === "settings" && <Settings />}

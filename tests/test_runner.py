@@ -83,6 +83,22 @@ def test_start_twice_is_busy(tmp_path):
         r.start(Config(), email="b@x.com", flow_fn=slow_flow)
 
 
+@pytest.mark.parametrize("extra,expected", [
+    ({}, "needs_manual"),
+    ({"phone_required": True}, "phone_required"),
+])
+def test_claude_without_session_key_is_not_success(tmp_path, extra, expected):
+    conn = db.init_db(tmp_path / "t.db")
+    r = runner.Runner(conn, tmp_path, _now)
+    rid = r.start(Config(), email="a@x.com",
+                  flow_fn=lambda **kw: {"email": "a@x.com", **extra})
+    for _ in range(50):
+        if db.get_run(conn, rid)["status"] != "running":
+            break
+        time.sleep(0.05)
+    assert db.get_run(conn, rid)["status"] == expected
+
+
 def test_flow_exception_marks_failed(tmp_path):
     conn = db.init_db(tmp_path / "t.db")
     r = runner.Runner(conn, tmp_path, _now)

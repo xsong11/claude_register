@@ -64,6 +64,22 @@ def test_extract_code_searches_html_and_subject():
     ) == "222222"
 
 
+def test_extract_code_openai_html_only_mail():
+    """OpenAI 验证码邮件只有 HTML，关键词与验证码之间隔着带数字的内联样式和 mso 条件注释。"""
+    from claude_register.chatgpt_flow import CHATGPT_CODE_REGEX
+
+    html = (
+        "<style>.x{padding:12px}</style>"
+        "<p>Enter this temporary verification code to continue:</p>"
+        '<p style="font-size: 24px; background-color: #F3F3F3; color: #5D5D5D; '
+        'border-radius: 16px; padding: 28px 24px; margin: 24px 0;">\n'
+        "<!--[if mso]>\n<span style=\"font-family: Lucida Console\">\n<![endif]-->\n"
+        "  198997\n</p>"
+    )
+    email = _email(subject="Your temporary ChatGPT verification code", html_body=html)
+    assert extract_code(email, CHATGPT_CODE_REGEX) == "198997"
+
+
 def test_extract_code_fallback_regex():
     email = _email(text_body="Verification: 654321")
     assert extract_code(email, DEFAULT_CODE_REGEX) is None

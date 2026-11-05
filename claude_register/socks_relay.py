@@ -76,7 +76,7 @@ MAX_CREDENTIAL_LEN = 255
 # 本地排队等槽位而不是冲上游被挂死。可用环境变量 RELAY_MAX_UPSTREAM 覆盖。
 # 默认取 3 而非实测的 ~4：留一格余量，免得上游偶尔只放 3 条（关连接的 TIME_WAIT
 # 残留、服务端抖动）时又擦边超订、重新触发 hang。确知上游能吃满 4 条时可上调。
-DEFAULT_MAX_UPSTREAM = 3
+DEFAULT_MAX_UPSTREAM = 16
 
 # 空闲隧道回收：有连接在排队等槽位时，把空闲（双向都没有字节）超过这么久的
 # 隧道掐掉，把槽位让给排队者。浏览器（尤其 Chromium）会把用过的 keep-alive
@@ -262,11 +262,20 @@ class _Tunnel:
         self.last_active = time.monotonic()
 
     def evict(self) -> None:
-        """掐断隧道：shutdown 唤醒两个方向阻塞在 recv 上的 _pipe，handler 随之收尾、释放槽位。"""
+        """掐断隧道：shutdown + close 唤醒两个方向阻塞在 recv 上的 _pipe，handler 随之收尾、释放槽位。
+
+        Windows 上仅调 shutdown(SHUT_RDWR) 不会唤醒另一个线程里阻塞的 sock.recv()，
+        必须同时调用 close() 才能让 recv() 立即抛错返回并释放上游并发槽位。
+        """
         self.evicted = True
         for sock in (self.client, self.upstream):
             try:
                 sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        for sock in (self.client, self.upstream):
+            try:
+                sock.close()
             except OSError:
                 pass
 

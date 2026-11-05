@@ -117,6 +117,26 @@ def _looks_like_org_payload(resp) -> bool:
     return False
 
 
+def org_uuid_from_payload(payload) -> str:
+    """组织列表里选一个组织 UUID：优先 raven_type == "team"，否则取第一个；没有返回空串。"""
+    if isinstance(payload, dict):
+        payload = payload.get("organizations")
+    if not isinstance(payload, list):
+        return ""
+    orgs = [o for o in payload if isinstance(o, dict) and o.get("uuid")]
+    for org in orgs:
+        if org.get("raven_type") == "team":
+            return str(org["uuid"])
+    return str(orgs[0]["uuid"]) if orgs else ""
+
+
+def _org_uuid(resp) -> str:
+    try:
+        return org_uuid_from_payload(resp.json())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _account_email(resp) -> str:
     """从 /api/account 响应里取邮箱；拿不到返回空串。"""
     if resp.status_code != 200 or _looks_like_shield(resp):
@@ -143,10 +163,24 @@ def check_session(
     timeout: float = 15.0,
     client_factory=None,
 ) -> tuple[str, str]:
-    status, detail, _ = probe_session(
+    status, detail, _, _ = _probe(
         session_key, proxy, timeout=timeout, client_factory=client_factory,
     )
     return status, detail
+
+
+def check_session_with_org(
+    session_key: str,
+    proxy: str | None = None,
+    *,
+    timeout: float = 15.0,
+    client_factory=None,
+) -> tuple[str, str, str]:
+    """检测 sessionKey，返回 (状态, 说明, 组织 UUID)；非 alive 时组织 UUID 为空串。"""
+    status, detail, _, org_uuid = _probe(
+        session_key, proxy, timeout=timeout, client_factory=client_factory,
+    )
+    return status, detail, org_uuid
 
 
 def probe_session(
@@ -162,21 +196,37 @@ def probe_session(
     want_email=True 且检测为 alive 时，用同一个客户端（同一条代理/中继）再请求
     /api/account 取账号邮箱；取不到邮箱不影响状态判定，邮箱返回空串。
     """
+    status, detail, email, _ = _probe(
+        session_key, proxy, want_email=want_email, timeout=timeout,
+        client_factory=client_factory,
+    )
+    return status, detail, email
+
+
+def _probe(
+    session_key: str,
+    proxy: str | None = None,
+    *,
+    want_email: bool = False,
+    timeout: float = 15.0,
+    client_factory=None,
+) -> tuple[str, str, str, str]:
     if not session_key:
-        return ("error", "无 sessionKey", "")
+        return ("error", "无 sessionKey", "", "")
     try:
         proxy_url = normalize_proxy_url(proxy)
     except Exception:  # noqa: BLE001
-        return ("error", f"代理无效：{mask_proxy(proxy or '')}", "")
+        return ("error", f"代理无效：{mask_proxy(proxy or '')}", "", "")
 
     factory = client_factory or _default_client
     try:
         client = factory(proxy_url)
     except Exception as exc:  # noqa: BLE001
         # socks5 缺 socksio 会在建 client 时报错
-        return ("error", f"发起请求失败：{exc}", "")
+        return ("error", f"发起请求失败：{exc}", "", "")
 
     email = ""
+    org_uuid = ""
     try:
         with client:
             resp = client.get(
@@ -186,6 +236,8 @@ def probe_session(
                 timeout=timeout,
             )
             status, detail = _classify(resp)
+            if status == "alive":
+                org_uuid = _org_uuid(resp)
             if want_email and status == "alive":
                 try:
                     email = _account_email(client.get(
@@ -197,8 +249,8 @@ def probe_session(
                 except Exception:  # noqa: BLE001
                     email = ""
     except Exception as exc:  # noqa: BLE001
-        return ("error", f"请求失败：{type(exc).__name__}", "")
-    return status, detail, email
+        return ("error", f"请求失败：{type(exc).__name__}", "", "")
+    return status, detail, email, org_uuid
 
 
 def _classify(resp) -> tuple[str, str]:

@@ -9,6 +9,7 @@ import socket
 import time
 
 from claude_register.anymail import AnyMailClient
+from claude_register.outlook import OutlookClient, is_outlook_credentials
 from claude_register.browser import (
     BROWSER_INSTALL_HINT,
     TAKEOVER_DENY_HOSTS,
@@ -109,7 +110,12 @@ class _BrowserHandle:
         FastAPI 请求线程直接调用，否则会破坏 Playwright Sync API 的线程绑定。
         """
         page = self._page
-        client = AnyMailClient(base_url=mail_base_url, api_key=mail_api_key)
+        if is_outlook_credentials(mail_base_url, mail_api_key):
+            client = OutlookClient.from_credentials(
+                email=email, mail_key=mail_api_key, mail_base_url=mail_base_url,
+            )
+        else:
+            client = AnyMailClient(base_url=mail_base_url, api_key=mail_api_key)
         since = utc_now_iso()
 
         # 旧 cookie 正是本次重新登录的原因。先删掉，避免后续读取时把它误认成

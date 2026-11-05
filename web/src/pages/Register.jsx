@@ -1,26 +1,78 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { api } from "../api.js";
 import { StatusBadge } from "@/components/status-badge";
+import { GroupDatalist } from "@/components/account-create-dialog";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 
+const PLATFORMS = [
+  ["claude", "Claude"],
+  ["chatgpt", "ChatGPT"],
+  ["both", "Claude + ChatGPT"],
+];
+const PLATFORM_LABEL = Object.fromEntries(PLATFORMS);
+
+export function PlatformBadge({ platform }) {
+  const p = platform || "claude";
+  return (
+    <Badge
+      variant="outline"
+      className={`rounded-full px-1.5 text-[11px] ${
+        p === "chatgpt" ? "border-teal-500/40 text-teal-400" : p === "both" ? "border-violet-500/40 text-violet-400" : ""
+      }`}
+    >
+      {PLATFORM_LABEL[p] || p}
+    </Badge>
+  );
+}
+
 export default function Register({ runStream }) {
   const { activeRunId, activeStatus, logLines, attach, streamEpoch } = runStream;
   const [proxies, setProxies] = useState([]);
   const [proxyId, setProxyId] = useState("");
+  const [platform, setPlatform] = useState("claude");
+  const [groupName, setGroupName] = useState("");
+  const [groups, setGroups] = useState([]);
   useEffect(() => {
     api.getConfig().then((cfg) => setProxies(cfg.saved_proxies || []))
       .catch(() => toast.error("代理列表加载失败，请刷新页面"));
+    api.listGroups().then((res) => setGroups(res.groups || [])).catch(() => {});
   }, []);
   const [domain, setDomain] = useState("");
   const [email, setEmail] = useState("");
   const [starting, setStarting] = useState(false);
   const [runs, setRuns] = useState([]);
   const [selectedRun, setSelectedRun] = useState(null);
+  const [previewIndex, setPreviewIndex] = useState(null);
   const logPanelRef = useRef(null);
+
+  const previewShots = selectedRun?.screenshots || [];
+  const previewCount = previewShots.length;
+  const previewOpen = previewIndex !== null && previewIndex < previewCount;
+  const previewName = previewOpen ? previewShots[previewIndex] : null;
+  const previewSrc = previewOpen ? `/runs/${selectedRun.id}/${previewName}` : null;
+  const stepPreview = (delta) =>
+    setPreviewIndex((i) => (i === null ? i : (i + delta + previewCount) % previewCount));
+
+  useEffect(() => {
+    setPreviewIndex(null);
+  }, [selectedRun?.id]);
+
+  useEffect(() => {
+    if (!previewOpen) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") setPreviewIndex(null);
+      else if (e.key === "ArrowLeft") stepPreview(-1);
+      else if (e.key === "ArrowRight") stepPreview(1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [previewOpen, previewCount]);
 
   useEffect(() => {
     api.listRuns().then(setRuns).catch(() => {});
@@ -34,7 +86,9 @@ export default function Register({ runStream }) {
   async function startRun() {
     setStarting(true);
     try {
-      const res = await api.startRun(email || undefined, domain || undefined, proxyId || undefined);
+      const res = await api.startRun(
+        email || undefined, domain || undefined, proxyId || undefined, platform, groupName.trim(),
+      );
       attach(res.run_id);
     } catch (err) {
       toast.error(err.status === 409 ? "已有任务在运行" : err.body?.detail || "启动失败，请重试");
@@ -59,6 +113,26 @@ export default function Register({ runStream }) {
             <CardTitle>开始注册</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
+            <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="目标平台">
+              {PLATFORMS.map(([v, label]) => (
+                <Button
+                  key={v}
+                  type="button"
+                  size="sm"
+                  role="radio"
+                  aria-checked={platform === v}
+                  variant={platform === v ? "default" : "outline"}
+                  onClick={() => setPlatform(v)}
+                >
+                  {label}
+                </Button>
+              ))}
+            </div>
+            {platform === "both" && (
+              <p className="text-xs text-muted-foreground">
+                先注册 Claude，再用同一邮箱、代理与 OKBrowser 窗口注册 ChatGPT。
+              </p>
+            )}
             <Input
               placeholder="邮箱后缀 / domain（可选）"
               value={domain}
@@ -77,6 +151,17 @@ export default function Register({ runStream }) {
                 {proxies.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
               </select>
               <p className="text-xs text-muted-foreground">在<a className="underline" href="#/proxies">代理池</a>保存代理后，可在此选择用于本次注册。</p>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor="registration-group" className="text-sm font-medium">归属分组</label>
+              <GroupDatalist id="registration-group-list" groups={groups} />
+              <Input
+                id="registration-group"
+                list="registration-group-list"
+                placeholder="可选；不填则保持账号原分组"
+                value={groupName}
+                onChange={(e) => setGroupName(e.target.value)}
+              />
             </div>
             <Button
               onClick={startRun}
@@ -124,7 +209,13 @@ export default function Register({ runStream }) {
                     className="flex cursor-pointer items-center justify-between gap-2 rounded-lg border bg-background/50 px-3 py-2.5 text-sm transition-colors hover:border-ring"
                   >
                     <span className="flex min-w-0 flex-col gap-0.5">
-                      <span className="font-mono text-xs">{r.id}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="font-mono text-xs">{r.id}</span>
+                        <PlatformBadge platform={r.platform} />
+                        {r.group_name ? (
+                          <span className="truncate text-[11px] text-muted-foreground">· {r.group_name}</span>
+                        ) : null}
+                      </span>
                       <span className="truncate text-xs text-muted-foreground">
                         {r.email || "（未指定邮箱）"} {r.domain ? `@${r.domain}` : ""}
                       </span>
@@ -152,20 +243,24 @@ export default function Register({ runStream }) {
                 </ScrollArea>
                 {selectedRun.screenshots && selectedRun.screenshots.length > 0 && (
                   <div className="mt-2 flex flex-wrap gap-2">
-                    {selectedRun.screenshots.map((name) => (
-                      <a
-                        key={name}
-                        href={`/runs/${selectedRun.id}/${name}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <img
-                          className="block h-[90px] w-[140px] rounded-md border object-cover"
-                          src={`/runs/${selectedRun.id}/${name}`}
-                          alt={name}
-                        />
-                      </a>
-                    ))}
+                    {selectedRun.screenshots.map((name, idx) => {
+                      const src = `/runs/${selectedRun.id}/${name}`;
+                      return (
+                        <button
+                          key={name}
+                          type="button"
+                          title={name}
+                          className="cursor-zoom-in rounded-md border p-0 transition-opacity hover:opacity-90"
+                          onClick={() => setPreviewIndex(idx)}
+                        >
+                          <img
+                            className="block h-[90px] w-[140px] rounded-md object-cover"
+                            src={src}
+                            alt={name}
+                          />
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -173,6 +268,60 @@ export default function Register({ runStream }) {
           </CardContent>
         </Card>
       </div>
+
+      {previewSrc && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          onClick={() => setPreviewIndex(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="截图预览"
+        >
+          <button
+            type="button"
+            className="absolute top-4 right-4 flex size-9 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
+            onClick={() => setPreviewIndex(null)}
+            aria-label="关闭预览"
+          >
+            <X className="size-5" />
+          </button>
+          {previewCount > 1 && (
+            <>
+              <button
+                type="button"
+                className="absolute top-1/2 left-4 flex size-11 -translate-y-1/2 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  stepPreview(-1);
+                }}
+                aria-label="上一张"
+              >
+                <ChevronLeft className="size-6" />
+              </button>
+              <button
+                type="button"
+                className="absolute top-1/2 right-4 flex size-11 -translate-y-1/2 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  stepPreview(1);
+                }}
+                aria-label="下一张"
+              >
+                <ChevronRight className="size-6" />
+              </button>
+            </>
+          )}
+          <img
+            className="max-h-[85vh] max-w-[85vw] rounded-md object-contain shadow-lg"
+            src={previewSrc}
+            alt={previewName}
+            onClick={(e) => e.stopPropagation()}
+          />
+          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-white/10 px-3 py-1 text-xs text-white">
+            {previewIndex + 1} / {previewCount} · {previewName}
+          </div>
+        </div>
+      )}
     </>
   );
 }

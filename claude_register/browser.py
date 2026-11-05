@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -183,37 +184,91 @@ TIMEZONE_LOOKUP_URLS = (
 )
 _TZ_RE = re.compile(r"^(UTC|[A-Za-z_]+(?:/[A-Za-z0-9_+\-]+)+)$")
 
+# curl 的 SOCKS5 应答码（RFC 1928）：代理握手成功但拒绝了这条连接
+_SOCKS5_REPLY = {
+    "1": "代理内部错误",
+    "2": "代理拒绝连接（规则不允许，常见于 IP 白名单/套餐到期）",
+    "3": "代理出口网络不可达",
+    "4": "目标主机不可达",
+    "5": "目标拒绝连接",
+    "6": "代理连接超时",
+}
 
-def lookup_timezone(proxy_url: str | None, *, timeout: float = 6.0) -> str | None:
+
+def _short_proxy_error(exc: Exception) -> str:
+    msg = str(exc)
+    m = re.search(r"cannot complete SOCKS5 connection to [^\s]+ \((\d+)\)", msg)
+    if m:
+        return _SOCKS5_REPLY.get(m.group(1), f"SOCKS5 应答码 {m.group(1)}")
+    m = re.search(r"curl: \(\d+\) ([^.]+)", msg)
+    return (m.group(1) if m else msg)[:120]
+
+
+def proxy_label(proxy_url: str | None) -> str:
+    """去掉账号密码的代理地址，用于日志/报错。"""
+    if not proxy_url:
+        return "本机直连"
+    parts = urlsplit(proxy_url)
+    host = parts.hostname or ""
+    return f"{parts.scheme}://{host}:{parts.port}" if parts.port else f"{parts.scheme}://{host}"
+
+
+def lookup_timezone(proxy_url: str | None, *, timeout: float = 6.0,
+                    direct: bool = False, errors: list | None = None) -> str | None:
     """经代理查出口 IP 的 IANA 时区（如 Asia/Tokyo），查不到返回 None。
 
     浏览器时区若与出口 IP 所在地对不上，是风控常用的可疑信号。SOCKS 一律用
     socks5h，域名交给上游解析：本地 DNS 可能是 fake-ip（198.18.x.x），拿虚拟
-    地址去 CONNECT 上游只会被拒。
+    地址去 CONNECT 上游只会被拒。direct=True 时没有代理也查（本机出口）。
+    传入 errors 列表时，每个站点失败的原因会追加进去，供调用方报错。
     """
-    if not proxy_url:
+    info = probe_proxy(proxy_url, timeout=timeout, direct=direct, errors=errors)
+    return info["timezone"] if info else None
+
+
+def probe_proxy(proxy_url: str | None, *, timeout: float = 6.0,
+                direct: bool = False, errors: list | None = None) -> dict | None:
+    """经代理查出口 IP 信息，成功返回 {ip, country, city, timezone, latency_ms}，全部失败返回 None。"""
+    errors = errors if errors is not None else []
+    if not proxy_url and not direct:
         return None
-    if proxy_url.startswith("socks5://"):
+    if proxy_url and proxy_url.startswith("socks5://"):
         proxy_url = "socks5h://" + proxy_url[len("socks5://"):]
     try:
         from curl_cffi import requests as cffi_requests
     except Exception:  # noqa: BLE001
         return None
     for url in TIMEZONE_LOOKUP_URLS:
+        t0 = time.monotonic()
         try:
             resp = cffi_requests.get(
-                url, proxy=proxy_url, timeout=timeout, impersonate="chrome",
+                url, proxy=proxy_url or None, timeout=timeout, impersonate="chrome",
             )
             if resp.status_code != 200:
+                errors.append(f"{urlsplit(url).hostname}: HTTP {resp.status_code}")
                 continue
             data = resp.json()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{urlsplit(url).hostname}: {_short_proxy_error(exc)}")
             continue
-        tz = data.get("timezone") if isinstance(data, dict) else None
+        latency_ms = max(1, round((time.monotonic() - t0) * 1000))
+        if not isinstance(data, dict):
+            continue
+        tz = data.get("timezone")
         if isinstance(tz, dict):  # ipwho.is: {"timezone": {"id": "Asia/Tokyo", ...}}
             tz = tz.get("id")
-        if isinstance(tz, str) and _TZ_RE.match(tz.strip()):
-            return tz.strip()
+        if not (isinstance(tz, str) and _TZ_RE.match(tz.strip())):
+            continue
+        ip = str(data.get("ip") or "").strip()
+        country = str(data.get("country_name") or data.get("country") or "").strip()
+        city = str(data.get("city") or data.get("region") or "").strip()
+        return {
+            "ip": ip,
+            "country": country,
+            "city": city,
+            "timezone": tz.strip(),
+            "latency_ms": latency_ms,
+        }
     return None
 
 
@@ -395,8 +450,114 @@ BROWSER_INSTALL_HINT = "请先运行 `uv run playwright install chromium` 下载
 
 
 @contextmanager
-def browser_session(proxy: str | None = None):
+def okbrowser_session(settings, proxy: str | None = None, *, name: str = "",
+                      window_id: str = "", on_window=None):
+    """在 OKBrowser 指纹窗口里经 CDP 接管浏览器，yield Playwright Browser。
+
+    window_id 非空时优先启动这个已有窗口（账号已绑定的），启动失败（多半是窗口已在
+    客户端里被删）再新建；否则直接新建带代理的窗口。代理交给 OKBrowser，不起本地中继。
+    OKBrowser 经 API 启动时不应用窗口配置里的时区/CPU 等指纹，这里另开一条 CDP
+    连接强制覆盖：时区对齐出口 IP，CPU 核数从常见值里随机。
+
+    结束时总是关闭窗口；settings.delete_after 为真时只删除本次新建的窗口，
+    复用的已绑定窗口不删。on_window(window_id) 在确定使用哪个窗口时回调一次，
+    窗口被删除后再以空串回调一次，调用方据此更新账号绑定。
+    """
+    from claude_register.cdp_override import CdpOverrideSession, FingerprintOverrides
+    from claude_register.okbrowser import OkBrowserClient, OkBrowserError
+
+    client = OkBrowserClient(settings.api_url)
+    window_name = name or f"claude-register-{int(time.time())}"
+    report = on_window or (lambda _wid: None)
+    window_id = (window_id or "").strip()
+    created = False
+    started = False
+    failure: BaseException | None = None
+    playwright = None
+    browser = None
+    override = None
+
+    def _create() -> str:
+        nonlocal created
+        wid = client.create(name=window_name, group_id=settings.group_id, proxy=proxy)
+        created = True
+        log(f"已在 OKBrowser 创建窗口：{window_name}（id={wid}）")
+        report(wid)
+        return wid
+
+    # 先确认代理可用再建窗口：代理不通时不留下用不了的空窗口
+    tz_errors: list = []
+    timezone = lookup_timezone(normalize_proxy_url(proxy), direct=True, errors=tz_errors)
+    if not timezone:
+        raise RuntimeError(
+            f"经代理 {proxy_label(proxy)} 查不到出口 IP 的时区，无法对齐浏览器时区；"
+            f"请检查代理是否可用（{'；'.join(tz_errors) or '无响应'}）。"
+        )
+    fingerprint = FingerprintOverrides.randomized(timezone)
+    if not window_id:
+        window_id = _create()
+    try:
+        if created:
+            ws = client.start(window_id)
+        else:
+            try:
+                client.update_proxy(window_id, proxy)
+                ws = client.start(window_id)
+                log(f"复用账号已绑定的 OKBrowser 窗口（id={window_id}）。")
+            except OkBrowserError as exc:
+                log(f"启动已绑定的 OKBrowser 窗口 {window_id} 失败（{exc}），改为新建窗口。")
+                window_id = _create()
+                ws = client.start(window_id)
+            else:
+                report(window_id)
+        started = True
+        relay_sink = current_sink()
+        override = CdpOverrideSession(
+            ws, fingerprint, on_error=lambda msg: relay_sink(msg),
+        ).start()
+        log(f"指纹覆盖：{fingerprint.describe()}")
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.connect_over_cdp(ws)
+        log("已通过 CDP 接管 OKBrowser 窗口。")
+        yield browser
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if playwright is not None:
+            playwright.stop()
+        if override is not None:
+            override.stop()
+        if started:
+            try:
+                client.close(window_id)
+            except Exception as exc:  # noqa: BLE001
+                log(f"关闭 OKBrowser 窗口失败（{exc}），忽略。")
+        if settings.delete_after and created:
+            try:
+                client.delete(window_id)
+                log("已删除 OKBrowser 窗口。")
+                report("")
+            except Exception as exc:  # noqa: BLE001
+                log(f"删除 OKBrowser 窗口失败（{exc}），请到客户端手动清理。")
+        else:
+            log(f"已保留 OKBrowser 窗口（id={window_id}），可在账号列表一键打开。")
+            if failure is not None and window_id:
+                # 流程中途出错时调用方拿不到返回值，借异常把保留的窗口带出去绑定到账号
+                failure.okbrowser_window_id = window_id
+
+
+@contextmanager
+def browser_session(proxy: str | None = None, *, okbrowser=None, name: str = "",
+                    window_id: str = "", on_window=None):
     """启动 Chromium 会话，yield Playwright Browser。
+
+    okbrowser 为 OkBrowserSettings 时改用 OKBrowser 指纹窗口（见 okbrowser_session）。
 
     headless 档位由 pick_headless() 按平台自动选：Linux 容器走 "virtual"（自管 Xvfb +
     有头模式），Windows/macOS 走 False（桌面真显示器）。两者都比真 headless 更抗
@@ -405,6 +566,11 @@ def browser_session(proxy: str | None = None):
     带认证的 SOCKS5 会先在本地拉起一个免认证中继（见 socks_relay），
     浏览器只连 127.0.0.1，凭据由中继负责递给上游。
     """
+    if okbrowser is not None:
+        with okbrowser_session(okbrowser, proxy, name=name, window_id=window_id,
+                               on_window=on_window) as browser:
+            yield browser
+        return
     proxy_options, relay, timezone = build_proxy_options(proxy)
     headless = pick_headless()
     display = None
@@ -442,7 +608,14 @@ def browser_session(proxy: str | None = None):
 
 
 def new_context(browser):
-    """统一的浏览器上下文：窗口尺寸即视口（no_viewport）；语言在启动层定好了。"""
+    """统一的浏览器上下文：窗口尺寸即视口（no_viewport）；语言在启动层定好了。
+
+    经 CDP 接管的指纹浏览器自带默认上下文，指纹和代理都挂在它上面，必须复用；
+    另开的新上下文不带这些配置。
+    """
+    existing = getattr(browser, "contexts", None)
+    if existing:
+        return existing[0]
     return browser.new_context(no_viewport=True)
 
 
@@ -544,13 +717,25 @@ def wait_login_form(page: Page, timeout_ms: int = 120_000) -> None:
 def fill_email(page: Page, email: str) -> None:
     email_box = page.get_by_placeholder("Enter your email")
     expect(email_box).to_be_visible(timeout=10_000)
+    # 给登录页后台的 Cloudflare Turnstile / 浏览器环境校验脚本留出加载和初始化时间，
+    # 避免刚 DOMContentLoaded 就秒点提交导致 "Couldn’t verify your browser. Try again."
+    page.wait_for_timeout(1_500)
     email_box.click()
     email_box.fill("")
-    email_box.press_sequentially(email, delay=30)
+    email_box.press_sequentially(email, delay=45)
     log(f"已填入邮箱：{email}")
+    page.wait_for_timeout(800)
 
     continue_btn = page.get_by_role("button", name="Continue with email")
     expect(continue_btn).to_be_enabled(timeout=10_000)
+    try:
+        box = continue_btn.bounding_box()
+        if box:
+            x = box["x"] + box["width"] / 2 + random.uniform(-12, 12)
+            y = box["y"] + box["height"] / 2 + random.uniform(-4, 4)
+            page.mouse.move(x, y, steps=random.randint(6, 12))
+    except Exception:
+        pass
     continue_btn.click()
     log("已点击 Continue with email")
 
@@ -599,6 +784,22 @@ def _reveal_code_input(page: Page) -> bool:
     return False
 
 
+def browser_verify_failed_visible(page: Page) -> bool:
+    """是否弹出了「Couldn’t verify your browser. Try again.」提示（注意弯引号 ’）。"""
+    for text in (
+        "verify your browser",
+        "Couldn\u2019t verify your browser",
+        "Couldn't verify your browser",
+    ):
+        try:
+            loc = page.get_by_text(text, exact=False)
+            if loc.count() >= 1 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def wait_code_screen(page: Page, timeout_ms: int = 60_000) -> bool:
     """等验证码输入框出现，中途自动点掉中间态按钮。
 
@@ -606,6 +807,7 @@ def wait_code_screen(page: Page, timeout_ms: int = 60_000) -> bool:
     """
     step = 2_000
     waited = 0
+    retried_submit = 0
     while waited < timeout_ms:
         if _code_input(page) is not None:
             log("验证码界面已出现。")
@@ -614,6 +816,19 @@ def wait_code_screen(page: Page, timeout_ms: int = 60_000) -> bool:
         if _code_input(page) is not None:
             log("验证码界面已出现。")
             return True
+        if browser_verify_failed_visible(page) and retried_submit < 3:
+            retried_submit += 1
+            log(f"检测到 Couldn't verify your browser，等待 3s 后重新点击 Continue with email（第 {retried_submit} 次）…")
+            try:
+                click_turnstile(page)
+                page.wait_for_timeout(3_000)
+                waited += 3_000
+                btn = page.get_by_role("button", name="Continue with email")
+                if btn.count() >= 1 and btn.first.is_visible() and btn.first.is_enabled():
+                    btn.first.click()
+                    log(f"已重新点击 Continue with email（第 {retried_submit} 次）")
+            except Exception as exc:
+                log(f"重试点击 Continue with email 失败（{exc}）。")
         try:
             current_url = page.url
         except Exception as exc:
@@ -962,16 +1177,80 @@ def chat_home_visible(page: Page) -> bool:
     return False
 
 
+class PhoneVerificationRequired(Exception):
+    """Claude 风控要求手机号验证；脚本无法继续，需换代理/IP 重跑。"""
+
+
+_PHONE_TEXTS = (
+    "Verify your phone number",
+    "Verify your phone",
+    "Enter your phone number",
+    "Add your phone number",
+    "What's your phone number",
+    "What\u2019s your phone number",
+    "Send verification code",
+)
+
+_PHONE_SELECTORS = (
+    "input[autocomplete='tel']",
+    "input[autocomplete='tel-national']",
+    "input[name*='phone' i]",
+    "input[id*='phone' i]",
+    "input[placeholder*='phone' i]",
+)
+
+
+def phone_verify_visible(page: Page) -> bool:
+    """是否出现了「验证手机号」页（Claude 风控对可疑 IP/邮箱的二次验证）。
+
+    不用裸的 input[type=tel] 判断：验证码输入框也可能是 tel 类型。
+    """
+    try:
+        if "phone" in (page.url or "").lower():
+            return True
+    except Exception:
+        pass
+    for text in _PHONE_TEXTS:
+        try:
+            loc = page.get_by_text(text, exact=False)
+            if loc.count() >= 1 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    for sel in _PHONE_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            if loc.count() >= 1 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _raise_phone_required(page: Page) -> None:
+    try:
+        screenshot(page, "phone_verify.png")
+        log(f"当前地址：{page.url}")
+    except Exception:
+        pass
+    log("Claude 要求验证手机号（多半是代理 IP / 邮箱被风控），本次无法自动完成，"
+        "请换个更干净的代理后重跑。")
+    raise PhoneVerificationRequired("需要手机号验证")
+
+
 def wait_post_auth(page: Page, timeout_ms: int = 90_000) -> str:
     """魔术链接/验证码提交后，等引导页或主界面就绪。
 
-    返回 "onboarding" / "chat" / "unknown"。
+    返回 "onboarding" / "chat" / "phone" / "unknown"。
     onboarding 包括条款建号页和 Join your team 页。
     """
     step = 2_000
     waited = 0
     while waited < timeout_ms:
         try:
+            if phone_verify_visible(page):
+                log("检测到手机号验证页。")
+                return "phone"
             if team_join_visible(page):
                 log("检测到 Join your team 页。")
                 return "onboarding"
@@ -1661,8 +1940,12 @@ def finish_after_auth(page: Page, timeout_ms: int = 90_000, display_name: str | 
       主界面
 
     老账号：直接落到主界面。
+
+    遇到手机号验证页时抛 PhoneVerificationRequired。
     """
     state = wait_post_auth(page, timeout_ms=timeout_ms)
+    if state == "phone":
+        _raise_phone_required(page)
     if state == "chat":
         screenshot(page, "logged_in.png")
         log(f"当前地址：{page.url}")
@@ -1692,6 +1975,8 @@ def finish_after_auth(page: Page, timeout_ms: int = 90_000, display_name: str | 
 
     while waited < follow_timeout:
         try:
+            if phone_verify_visible(page):
+                _raise_phone_required(page)
             if chat_home_visible(page):
                 log("建号完成，已进入主界面。")
                 screenshot(page, "after_create_account.png")
@@ -1765,6 +2050,8 @@ def finish_after_auth(page: Page, timeout_ms: int = 90_000, display_name: str | 
             blank_rounds = 0
 
             current_url = page.url
+        except PhoneVerificationRequired:
+            raise
         except Exception as exc:
             log(f"建号后续等待时页面不可用（{exc}）。")
             try:

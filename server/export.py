@@ -41,10 +41,19 @@ FIELDS: tuple[ExportField, ...] = (
     ExportField("org_uuid", "orgUuid", "组织 UUID"),
     ExportField("account_uuid", "accountUuid", "Claude 账号 UUID"),
     ExportField("oauth_at", "oauthAt", "授权时间"),
+    ExportField("group_name", "group", "分组"),
+    ExportField("okbrowser_window_id", "okbrowserId", "OKBrowser 窗口 ID"),
+    ExportField("chatgpt_status", "chatgptStatus", "ChatGPT 状态"),
+    ExportField("chatgpt_password", "chatgptPassword", "ChatGPT 密码", secret=True),
+    ExportField("chatgpt_session_token", "chatgptSessionToken", "ChatGPT sessionToken",
+                secret=True),
+    ExportField("chatgpt_access_token", "chatgptAccessToken", "ChatGPT accessToken",
+                secret=True),
+    ExportField("chatgpt_token_expires_at", "chatgptExpiresAt", "ChatGPT 令牌过期时间"),
 )
 FIELD_BY_KEY = {f.key: f for f in FIELDS}
 DEFAULT_FIELDS: tuple[str, ...] = ("email", "session_key", "proxy", "mail_base_url", "mail_key")
-FORMATS: tuple[str, ...] = ("text", "json", "csv", "line", "sub2api")
+FORMATS: tuple[str, ...] = ("text", "json", "csv", "line", "sub2api", "outlook")
 DEFAULT_LINE_SEP = "----"
 MAX_SEP_LEN = 16
 
@@ -116,18 +125,48 @@ def pick(row: dict, fields) -> dict:
     return out
 
 
+PLATFORMS = ("claude", "chatgpt")
+UNGROUPED = "__ungrouped__"
+
+
+def parse_platform(raw) -> str | None:
+    if raw is None or str(raw).strip() == "":
+        return None
+    val = str(raw).strip().lower()
+    if val not in PLATFORMS:
+        raise ExportError(f"platform 只能是 {' / '.join(PLATFORMS)}")
+    return val
+
+
+def _has_platform(row: dict, platform: str) -> bool:
+    if platform == "chatgpt":
+        return bool(row.get("chatgpt_session_token") or row.get("chatgpt_access_token"))
+    return bool(row.get("session_key"))
+
+
 def filter_rows(rows, *, emails=None, status=None, check_status=None,
-                claimed: bool | None = None) -> list[dict]:
+                claimed: bool | None = None, group: str | None = None,
+                platform: str | None = None) -> list[dict]:
+    """platform 不填时 status / check_status / claimed 按 Claude 列筛选（与旧版一致）；
+    platform="chatgpt" 时只要有 ChatGPT 凭据的账号，且这三项改看 chatgpt_* 列。"""
     wanted = {e.strip().lower() for e in (emails or []) if e and e.strip()}
+    prefix = "chatgpt_" if platform == "chatgpt" else ""
     out = []
     for row in rows:
         if wanted and str(row.get("email") or "").lower() not in wanted:
             continue
-        if status and (row.get("status") or "") != status:
+        if platform and not _has_platform(row, platform):
             continue
-        if check_status and (row.get("check_status") or "") != check_status:
+        if status and (row.get(f"{prefix}status") or "") != status:
             continue
-        if claimed is not None and bool(row.get("claimed_at")) != claimed:
+        if check_status and (row.get(f"{prefix}check_status") or "") != check_status:
+            continue
+        if claimed is not None and bool(row.get(f"{prefix}claimed_at")) != claimed:
+            continue
+        if group == UNGROUPED:
+            if row.get("group_name"):
+                continue
+        elif group and (row.get("group_name") or "") != group:
             continue
         out.append(row)
     return out
@@ -142,6 +181,9 @@ def render(rows, fields, fmt: str, *, sep: str = DEFAULT_LINE_SEP) -> tuple[str,
     if fmt == "sub2api":
         return json.dumps(sub2api_payload(rows), ensure_ascii=False, indent=2) + "\n", \
             "application/json"
+    if fmt == "outlook":
+        body = "\n".join(outlook_lines(rows, sep=sep))
+        return (body + "\n") if body else "", "text/plain; charset=utf-8"
     items = [pick(r, fields) for r in rows]
     if fmt == "json":
         return json.dumps(items, ensure_ascii=False, indent=2) + "\n", "application/json"
@@ -160,7 +202,28 @@ def render(rows, fields, fmt: str, *, sep: str = DEFAULT_LINE_SEP) -> tuple[str,
     return (body + "\n") if body else "", "text/plain; charset=utf-8"
 
 
-FILE_EXT = {"text": "txt", "json": "json", "csv": "csv", "line": "txt", "sub2api": "json"}
+FILE_EXT = {"text": "txt", "json": "json", "csv": "csv", "line": "txt", "sub2api": "json",
+            "outlook": "txt"}
+
+
+def outlook_lines(rows, *, sep: str = DEFAULT_LINE_SEP) -> list[str]:
+    """Outlook 账号还原成导入格式并追加 sessionKey：邮箱/密码/client_id/refresh_token/sk。
+
+    非 Outlook 账号跳过。
+    """
+    from claude_register.outlook import parse_outlook_mail_key
+
+    lines = []
+    for row in rows:
+        parsed = parse_outlook_mail_key(row.get("mail_key"), row.get("mail_base_url"))
+        if parsed is None:
+            continue
+        client_id, refresh_token = parsed
+        lines.append(sep.join((
+            str(row.get("email") or ""), str(row.get("password") or ""),
+            client_id, refresh_token, str(row.get("session_key") or ""),
+        )))
+    return lines
 
 # ---- sub2api 数据导入格式（管理后台「账号 → 导入数据」）----
 

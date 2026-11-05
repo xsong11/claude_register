@@ -25,6 +25,20 @@ def test_alive_200_json():
     assert check_session("sk-x", client_factory=make) == ("alive", "有效")
 
 
+def test_alive_returns_org_uuid_preferring_team():
+    from claude_register.session_check import check_session_with_org
+
+    orgs = [{"uuid": "org-personal", "raven_type": None}, {"uuid": "org-team", "raven_type": "team"}]
+    make, _ = _factory(lambda req: httpx.Response(200, json=orgs))
+    assert check_session_with_org("sk-x", client_factory=make) == ("alive", "有效", "org-team")
+
+    make, _ = _factory(lambda req: httpx.Response(200, json=[{"uuid": "org1"}]))
+    assert check_session_with_org("sk-x", client_factory=make)[2] == "org1"
+
+    make, _ = _factory(lambda req: httpx.Response(401, json={"error": {}}))
+    assert check_session_with_org("sk-x", client_factory=make)[2] == ""
+
+
 def test_dead_401_json():
     make, _ = _factory(lambda req: httpx.Response(401, json={"error": {"type": "authentication_error"}}))
     status, _ = check_session("sk-x", client_factory=make)

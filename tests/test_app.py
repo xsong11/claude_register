@@ -81,6 +81,7 @@ def test_stream_no_duplicate_lines(tmp_path, monkeypatch):
     def fake_flow(**kw):
         console.log("LINE_ONE")
         console.log("LINE_TWO")
+        return {"email": "a@x.com", "sessionKey": "sk-test"}
 
     monkeypatch.setattr(flow, "run", fake_flow)
 

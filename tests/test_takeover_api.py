@@ -44,7 +44,8 @@ def _client(tmp_path, monkeypatch):
             return "sk-new"
 
     monkeypatch.setattr(deps, "TakeoverManager", FakeMgr)
-    monkeypatch.setattr("server.app.check_session", lambda *a, **k: ("alive", "有效"))
+    monkeypatch.setattr("server.app.check_session_with_org",
+                        lambda *a, **k: ("alive", "有效", "org-1"))
 
     mail_control = {
         "invalid_keys": set(),
@@ -316,8 +317,8 @@ def test_takeover_relogin_rejects_new_dead_session(tmp_path, monkeypatch):
         mail_base_url="https://mail.test",
     )
     app = _client(tmp_path, monkeypatch)
-    monkeypatch.setattr("server.app.check_session", lambda *a, **k: (
-        "dead", "已失效（HTTP 403）",
+    monkeypatch.setattr("server.app.check_session_with_org", lambda *a, **k: (
+        "dead", "已失效（HTTP 403）", "",
     ))
     c = TestClient(app); _login(c)
     c.post("/api/takeover/start", json={"email": "a@x.com"})

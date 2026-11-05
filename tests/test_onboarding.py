@@ -990,3 +990,46 @@ def test_finish_after_auth_skips_work_role(monkeypatch):
 
     assert browser.finish_after_auth(_Page(), timeout_ms=5_000) is True
     assert clicks["skip"] == 1
+
+
+def test_phone_verify_visible_by_text_and_input():
+    page = _Page(url="https://claude.ai/onboarding")
+    assert browser.phone_verify_visible(page) is False
+    page.text_map["Verify your phone number"] = _Loc()
+    assert browser.phone_verify_visible(page) is True
+
+    page2 = _Page(url="https://claude.ai/onboarding")
+    page2.locator_map["input[autocomplete='tel']"] = _Loc()
+    assert browser.phone_verify_visible(page2) is True
+
+    assert browser.phone_verify_visible(_Page(url="https://claude.ai/verify-phone")) is True
+
+
+def test_wait_post_auth_returns_phone():
+    page = _Page(text_map={"Verify your phone number": _Loc()})
+    assert browser.wait_post_auth(page, timeout_ms=1000) == "phone"
+
+
+def test_finish_after_auth_raises_on_phone(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(browser, "screenshot", lambda p, name: Path(name))
+    page = _Page(text_map={"Verify your phone number": _Loc()})
+    with pytest.raises(browser.PhoneVerificationRequired):
+        browser.finish_after_auth(page, timeout_ms=1000)
+
+
+def test_finish_after_auth_raises_when_phone_appears_mid_onboarding(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(browser, "screenshot", lambda p, name: Path(name))
+    calls = {"n": 0}
+
+    def phone_later(p):
+        calls["n"] += 1
+        return calls["n"] > 1  # wait_post_auth 时还没有，进 onboarding 循环后出现
+
+    monkeypatch.setattr(browser, "phone_verify_visible", phone_later)
+    page = _Page(role_map={("heading", "Let's create your account"): _Loc()})
+    with pytest.raises(browser.PhoneVerificationRequired):
+        browser.finish_after_auth(page, timeout_ms=1000)

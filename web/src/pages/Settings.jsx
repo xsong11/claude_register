@@ -54,6 +54,39 @@ const GROUPS = [
     ],
   },
   {
+    title: "浏览器",
+    fields: [
+      {
+        key: "browser_mode",
+        label: "注册使用的浏览器",
+        type: "select",
+        options: [
+          ["chromium", "内置 Chromium（默认）"],
+          ["okbrowser", "OKBrowser 指纹浏览器（需付费版，客户端需打开并登录）"],
+        ],
+      },
+      {
+        key: "okbrowser_api_url",
+        label: "OKBrowser 本地 API 地址",
+        type: "text",
+        placeholder: "http://localhost:30396",
+        showIf: (form) => form.browser_mode === "okbrowser",
+      },
+      {
+        key: "okbrowser_group_id",
+        label: "OKBrowser 分组 ID（选填，新建窗口放进这个分组）",
+        type: "text",
+        showIf: (form) => form.browser_mode === "okbrowser",
+      },
+      {
+        key: "okbrowser_delete_after",
+        label: "注册结束后删除 OKBrowser 窗口",
+        type: "checkbox",
+        showIf: (form) => form.browser_mode === "okbrowser",
+      },
+    ],
+  },
+  {
     title: "sub2api 对接",
     fields: [
       {
@@ -282,8 +315,22 @@ export default function Settings({ onPasswordSet }) {
               <CardTitle>{group.title}</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              {group.fields.map((f) =>
-                f.type === "apikey" ? (
+              {group.fields.filter((f) => !f.showIf || f.showIf(form)).map((f) =>
+                f.type === "select" ? (
+                  <div className="space-y-1.5" key={f.key}>
+                    <Label htmlFor={f.key}>{f.label}</Label>
+                    <select
+                      id={f.key}
+                      className="h-9 w-full rounded-md border bg-background px-2 text-sm"
+                      value={form[f.key] ?? ""}
+                      onChange={(e) => setField(f.key, e.target.value)}
+                    >
+                      {f.options.map(([v, text]) => (
+                        <option key={v} value={v}>{text}</option>
+                      ))}
+                    </select>
+                  </div>
+                ) : f.type === "apikey" ? (
                   <ApiKeyField
                     key={f.key}
                     value={form[f.key]}

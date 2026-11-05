@@ -8,6 +8,7 @@ __pycache__/
 .superpowers/
 data/
 config.yaml
+/cookies.txt
 web/dist/
 web/node_modules/
 

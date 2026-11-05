@@ -3,7 +3,9 @@ import { toast } from "sonner";
 import { Upload } from "lucide-react";
 import { api } from "../api.js";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { GroupDatalist } from "@/components/account-create-dialog";
 import {
   AlertDialog,
   AlertDialogCancel,
@@ -32,9 +34,10 @@ function loadSaved() {
   }
 }
 
-export function ImportDialog({ open, onOpenChange, onImported }) {
+export function ImportDialog({ open, onOpenChange, onImported, groups = [] }) {
   const [proxies, setProxies] = useState([]);
   const [proxyId, setProxyId] = useState("");
+  const [groupName, setGroupName] = useState("");
   const [check, setCheck] = useState(true);
   const [skipDead, setSkipDead] = useState(true);
   const [text, setText] = useState("");
@@ -60,7 +63,7 @@ export function ImportDialog({ open, onOpenChange, onImported }) {
   }, [open]);
 
   async function doImport() {
-    if (!text.trim()) return toast.error("请粘贴要导入的 sessionKey");
+    if (!text.trim()) return toast.error("请粘贴要导入的 sessionKey 或 Outlook 邮箱");
     setBusy(true);
     try {
       const res = await api.importAccounts({
@@ -68,6 +71,7 @@ export function ImportDialog({ open, onOpenChange, onImported }) {
         proxy_id: proxyId || undefined,
         check,
         skip_dead: skipDead,
+        group_name: groupName.trim() || undefined,
       });
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ proxyId, check, skipDead }));
       setReport(res);
@@ -90,16 +94,19 @@ export function ImportDialog({ open, onOpenChange, onImported }) {
     <AlertDialog open={open} onOpenChange={(o) => !busy && onOpenChange(o)}>
       <AlertDialogContent className="max-w-2xl">
         <AlertDialogHeader>
-          <AlertDialogTitle>导入 sessionKey</AlertDialogTitle>
+          <AlertDialogTitle>批量导入 SK / Outlook 邮箱</AlertDialogTitle>
           <AlertDialogDescription>
-            每行一个账号：<code>sk-ant-…</code>，或 <code>邮箱----sk-ant-…</code>（分隔符不限）。
-            只有 sk 时会在检测时向 claude.ai 查询邮箱。
+            每行一个账号，支持：
+            <br />
+            1. <strong>sessionKey</strong>：<code>sk-ant-…</code> 或 <code>邮箱----sk-ant-…</code>
+            <br />
+            2. <strong>Outlook 邮箱</strong>：<code>邮箱----密码----client_id----refresh_token…</code>（导入为「待注册」，可在列表单点或勾选批量注册）
           </AlertDialogDescription>
         </AlertDialogHeader>
         <div className="space-y-4 text-sm">
           <textarea
             className="h-40 w-full resize-y rounded-md border bg-background p-2 font-mono text-xs"
-            placeholder={"sk-ant-sid01-xxxx\nuser@example.com----sk-ant-sid01-yyyy"}
+            placeholder={"user@outlook.com----password----client_id----M.C548_SN1...\nsk-ant-sid01-xxxx\nuser@example.com----sk-ant-sid01-yyyy"}
             spellCheck={false}
             value={text}
             disabled={busy}
@@ -118,20 +125,32 @@ export function ImportDialog({ open, onOpenChange, onImported }) {
               {proxies.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
             </select>
             <p className="text-xs text-muted-foreground">
-              所选代理会用于检测，并写入账号的代理字段（之后检测 / 接管都走它）。在
+              所选代理会写入账号的代理字段（之后自动注册 / 检测 / 接管都走它）。在
               <a className="underline" href="#/proxies">代理池</a>中管理代理。
             </p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="import-group">所属分组</Label>
+            <GroupDatalist id="import-group-list" groups={groups} />
+            <Input
+              id="import-group"
+              list="import-group-list"
+              value={groupName}
+              placeholder="不填则不改分组；可选已有分组或输入新分组名"
+              disabled={busy}
+              onChange={(e) => setGroupName(e.target.value)}
+            />
           </div>
           <div className="flex flex-wrap gap-x-6 gap-y-2">
             <label className="flex cursor-pointer items-center gap-2">
               <input type="checkbox" className="size-4 accent-primary" checked={check}
                 disabled={busy} onChange={(e) => setCheck(e.target.checked)} />
-              导入前检测有效性并查询邮箱
+              导入前检测有效性（SK 查存活与邮箱 / Outlook 校验 refresh_token）
             </label>
             <label className="flex cursor-pointer items-center gap-2">
               <input type="checkbox" className="size-4 accent-primary" checked={skipDead}
                 disabled={busy || !check} onChange={(e) => setSkipDead(e.target.checked)} />
-              跳过已失效的 sk
+              跳过已失效的凭据
             </label>
           </div>
           {report && (

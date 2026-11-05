@@ -1,12 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import { Download, KeyRound, LogIn, Plus, Search, Trash2, Upload } from "lucide-react";
+import {
+  ChevronDown, Download, ExternalLink, FolderCog, FolderInput, KeyRound, LogIn, Mail, MessageSquare,
+  MonitorPlay, Play, Plus, RefreshCw, Search, Server, ShieldCheck, Square, Trash2, Upload,
+} from "lucide-react";
 import { api } from "../api.js";
 import { cn } from "@/lib/utils";
-import { StatusBadge } from "@/components/status-badge";
+import { PlatformStatusBadge } from "@/components/status-badge";
 import { ExportDialog } from "@/components/export-dialog";
 import { ImportDialog } from "@/components/import-dialog";
 import { ManualLoginDialog } from "@/components/manual-login-dialog";
+import { MailDialog } from "@/components/mail-dialog";
+import { GroupManageDialog } from "@/components/group-manage-dialog";
 import {
   AccountCreateDialog,
   AccountFields,
@@ -17,6 +22,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -30,6 +43,8 @@ import {
 
 const FILTERS = [
   ["all", "全部"],
+  ["pending", "待注册"],
+  ["phone_required", "需手机验证"],
   ["alive", "有效"],
   ["dead", "失效"],
   ["blocked", "被拦截"],
@@ -39,10 +54,39 @@ const FILTERS = [
   ["no_sk", "无 sessionKey"],
   ["oauth", "已授权 OAuth"],
   ["no_oauth", "未授权 OAuth"],
+  ["chatgpt_success", "ChatGPT 已注册"],
+  ["chatgpt_pending", "ChatGPT 未注册"],
+  ["chatgpt_alive", "ChatGPT 有效"],
+  ["chatgpt_dead", "ChatGPT 失效"],
+  ["chatgpt_banned", "ChatGPT 已封禁"],
 ];
+
+const ALL_GROUPS = "__all__";
+const UNGROUPED = "__ungrouped__";
+
+const hasChatGPT = (a) => !!(a.chatgpt_session_token || a.chatgpt_access_token);
+
+function matchGroup(a, group) {
+  if (group === ALL_GROUPS) return true;
+  if (group === UNGROUPED) return !a.group_name;
+  return a.group_name === group;
+}
 
 function matchFilter(a, filter) {
   switch (filter) {
+    case "chatgpt_success":
+      return a.chatgpt_status === "success";
+    case "chatgpt_pending":
+      return !a.chatgpt_status;
+    case "chatgpt_alive":
+      return a.chatgpt_check_status === "alive";
+    case "chatgpt_dead":
+      return a.chatgpt_check_status === "dead";
+    case "chatgpt_banned":
+      return a.chatgpt_check_status === "banned";
+    case "pending":
+    case "phone_required":
+      return a.status === filter;
     case "alive":
     case "dead":
     case "blocked":
@@ -64,13 +108,44 @@ function matchFilter(a, filter) {
   }
 }
 
-function matchQuery(a, q) {
+function matchQuery(a, q, proxyName) {
   if (!q) return true;
-  return [a.email, a.display_name, a.proxy, a.session_key]
+  return [a.email, a.display_name, a.proxy, proxyName, a.session_key, a.group_name]
     .some((v) => String(v || "").toLowerCase().includes(q));
 }
 
-const LIVE_LABEL = { alive: "有效", dead: "失效", blocked: "被拦截", error: "检测失败" };
+function ChatGPTBadge({ acct }) {
+  const live = acct.chatgpt_check_status;
+  const banned = live === "banned" || acct.chatgpt_status === "banned";
+  return (
+    <PlatformStatusBadge
+      platform="ChatGPT"
+      status={banned ? "banned" : acct.chatgpt_status}
+      extra={live && !banned ? LIVE_LABEL[live] || live : ""}
+      className={live === "dead" || banned ? "bg-red-500/15 text-red-400" : ""}
+      title={
+        acct.chatgpt_status
+          ? [
+              acct.chatgpt_access_token ? "已有 accessToken" : "无 accessToken",
+              acct.chatgpt_checked_at ? `检测时间：${acct.chatgpt_checked_at}` : "",
+              acct.chatgpt_token_expires_at ? `accessToken 过期：${acct.chatgpt_token_expires_at}` : "",
+            ].filter(Boolean).join("\n")
+          : "尚未用此邮箱注册 ChatGPT"
+      }
+    />
+  );
+}
+
+// sessionToken / accessToken 已在上方编辑表单里完整展示，这里不再重复
+const CHATGPT_COPY_FIELDS = [
+  ["chatgpt_password", "密码"],
+  ["chatgpt_account_id", "账号 ID"],
+];
+
+
+const LIVE_LABEL = {
+  alive: "有效", dead: "失效", blocked: "被拦截", error: "检测失败", banned: "已封禁",
+};
 const LIVE_CLS = {
   alive: "bg-emerald-500/15 text-emerald-400",
   dead: "bg-red-500/15 text-red-400",
@@ -141,10 +216,15 @@ const OAUTH_COPY_FIELDS = [
   ["account_uuid", "账号 UUID"],
 ];
 
-export default function Accounts({ attach, running, navigate }) {
+export default function Accounts({
+  attach, running, navigate, group = "", onGroupChange, onGroupsLoaded,
+}) {
   const [accounts, setAccounts] = useState([]);
   const [authorizing, setAuthorizing] = useState(() => new Set());
   const [batchOAuth, setBatchOAuth] = useState(null); // {done, total, ok, failed}
+  const [batchCheck, setBatchCheck] = useState(null); // {done, total, alive, dead, other}
+  const [batchReg, setBatchReg] = useState(null); // {done, total, ok, failed, current}
+  const stopBatchRegRef = useRef(false);
   const [takeover, setTakeover] = useState({ running: false, email: null });
   const [relogging, setRelogging] = useState(false);
   const [checking, setChecking] = useState("");
@@ -155,20 +235,49 @@ export default function Accounts({ attach, running, navigate }) {
   const busyRef = useRef(false);
   const [copiedEmail, setCopiedEmail] = useState("");
   const [editingEmail, setEditingEmail] = useState("");
+  const [mailEmail, setMailEmail] = useState("");
   const [editForm, setEditForm] = useState({});
   // 待删除的邮箱列表；单个删除也走数组，空数组表示没有待确认的删除
   const [deleteTargets, setDeleteTargets] = useState([]);
   const [createOpen, setCreateOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
+  const groupFilter = group || ALL_GROUPS;
+  const setGroupFilter = (v) => onGroupChange?.(v === ALL_GROUPS ? "" : v);
+  const [groups, setGroups] = useState({ groups: [], ungrouped_count: 0, loaded: false });
+  const [groupManageOpen, setGroupManageOpen] = useState(false);
+  const [okbMode, setOkbMode] = useState(false);
+  const [savedProxies, setSavedProxies] = useState([]);
+  const [okbBusy, setOkbBusy] = useState("");
+  const [deleteWindows, setDeleteWindows] = useState(true);
+  const [checkingChatGPT, setCheckingChatGPT] = useState("");
+  const [sessionBusy, setSessionBusy] = useState("");
+  const [sessionOpen, setSessionOpen] = useState("");
+  const [sessionCache, setSessionCache] = useState({});
+  const [batchChatGPTCheck, setBatchChatGPTCheck] = useState(null);
   const [selected, setSelected] = useState(() => new Set());
   const [saving, setSaving] = useState(false);
 
+  const proxyNameByUrl = useMemo(
+    () => new Map(savedProxies.map((p) => [p.url, p.name])),
+    [savedProxies],
+  );
+
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return accounts.filter((a) => matchFilter(a, filter) && matchQuery(a, q));
-  }, [accounts, query, filter]);
+    return accounts.filter(
+      (a) =>
+        matchGroup(a, groupFilter)
+        && matchFilter(a, filter)
+        && matchQuery(a, q, proxyNameByUrl.get(a.proxy) || ""),
+    );
+  }, [accounts, query, filter, groupFilter, proxyNameByUrl]);
+  const deleteTargetWindows = accounts.filter(
+    (a) => deleteTargets.includes(a.email) && a.okbrowser_window_id,
+  ).length;
   const selectedVisible = visible.filter((a) => selected.has(a.email));
+  const selectedSk = selectedVisible.filter((a) => a.session_key).map((a) => a.email);
+  const selectedGpt = selectedVisible.filter(hasChatGPT).map((a) => a.email);
   const allVisibleSelected = visible.length > 0 && selectedVisible.length === visible.length;
 
   // 列表刷新后剔除已经不存在的选中项
@@ -196,14 +305,267 @@ export default function Accounts({ attach, running, navigate }) {
       return next;
     });
 
+  function refreshGroups() {
+    api
+      .listGroups()
+      .then((res) => {
+        setGroups({ ...res, loaded: true });
+        onGroupsLoaded?.(res);
+      })
+      .catch(() => {});
+  }
+
   function refreshLists() {
     api.listAccounts().then(setAccounts).catch(() => {});
     api.takeoverStatus().then(setTakeover).catch(() => {});
+    refreshGroups();
   }
 
   useEffect(() => {
     refreshLists();
+    api
+      .getConfig()
+      .then((cfg) => {
+        setOkbMode(cfg.browser_mode === "okbrowser");
+        setSavedProxies(cfg.saved_proxies || []);
+      })
+      .catch(() => {});
   }, []);
+
+  // 分组被删/改名后，当前筛选的分组不存在了就退回「全部」
+  useEffect(() => {
+    if (!groups.loaded || groupFilter === ALL_GROUPS || groupFilter === UNGROUPED) return;
+    if (!groups.groups.some((g) => g.name === groupFilter)) setGroupFilter(ALL_GROUPS);
+  }, [groups, groupFilter]);
+
+  async function moveToGroup(emails, groupName) {
+    if (!emails.length) return;
+    try {
+      const res = await api.accountsBatchGroup(emails, groupName);
+      toast.success(
+        groupName ? `已将 ${res.updated} 个账号移入「${groupName}」` : `已将 ${res.updated} 个账号移出分组`,
+      );
+      refreshLists();
+    } catch (e) {
+      if (e?.status !== 401) toast.error(e.body?.detail || `移动分组失败（${e.status || "?"}）`);
+    }
+  }
+
+  function onBatchGroupSelect(value) {
+    const emails = selectedVisible.map((a) => a.email);
+    if (value === "__new__") {
+      const name = window.prompt("新分组名称");
+      if (name && name.trim()) moveToGroup(emails, name.trim());
+    } else if (value === UNGROUPED) {
+      moveToGroup(emails, "");
+    } else if (value) {
+      moveToGroup(emails, value);
+    }
+  }
+
+  async function applyBatchProxy(emails, payload, label) {
+    if (!emails.length) return;
+    try {
+      const res = await api.accountsBatchProxy(emails, payload);
+      toast.success(
+        label
+          ? `已将 ${res.updated} 个账号的代理设为「${label}」`
+          : `已清除 ${res.updated} 个账号的代理`,
+      );
+      refreshLists();
+    } catch (e) {
+      if (e?.status !== 401) toast.error(e.body?.detail || `修改代理失败（${e.status || "?"}）`);
+    }
+  }
+
+  function onBatchProxySelect(value, label) {
+    const emails = selectedVisible.map((a) => a.email);
+    if (value === "__custom__") {
+      const url = window.prompt("代理地址（如 socks5://user:pass@host:port 或 http://host:port）");
+      if (url && url.trim()) applyBatchProxy(emails, { proxy: url.trim() }, url.trim());
+    } else if (value) {
+      applyBatchProxy(emails, value, label);
+    }
+  }
+
+  const patchAccount = (email, patch) =>
+    setAccounts((list) => list.map((a) => (a.email === email ? { ...a, ...patch } : a)));
+
+  async function openWindow(a) {
+    setOkbBusy(a.email);
+    try {
+      const res = await api.okbrowserStart(a.email);
+      patchAccount(a.email, { okbrowser_window_id: res.window_id });
+      toast.success(
+        res.created
+          ? `已为「${a.email}」新建并打开 OKBrowser 窗口 #${res.window_id}`
+          : `已打开 OKBrowser 窗口 #${res.window_id}`,
+      );
+    } catch (e) {
+      if (e?.status !== 401) toast.error(e.body?.detail || `打开窗口失败（${e.status || "?"}）`);
+    } finally {
+      setOkbBusy("");
+    }
+  }
+
+  async function closeWindow(a) {
+    setOkbBusy(a.email);
+    try {
+      await api.okbrowserClose(a.email);
+      toast.success("已关闭 OKBrowser 窗口");
+    } catch (e) {
+      if (e?.status !== 401) toast.error(e.body?.detail || `关闭窗口失败（${e.status || "?"}）`);
+    } finally {
+      setOkbBusy("");
+    }
+  }
+
+  async function removeWindow(a, unbindOnly) {
+    if (!unbindOnly && !window.confirm(`从 OKBrowser 彻底删除窗口 #${a.okbrowser_window_id}？`)) return;
+    setOkbBusy(a.email);
+    try {
+      await api.okbrowserDelete(a.email, unbindOnly);
+      patchAccount(a.email, { okbrowser_window_id: "" });
+      setEditForm((f) => ({ ...f, okbrowser_window_id: "" }));
+      toast.success(unbindOnly ? "已解绑 OKBrowser 窗口" : "已删除 OKBrowser 窗口");
+    } catch (e) {
+      if (e?.status !== 401) toast.error(e.body?.detail || `操作失败（${e.status || "?"}）`);
+    } finally {
+      setOkbBusy("");
+    }
+  }
+
+  function applyChatGPTCheck(acctEmail, res) {
+    patchAccount(acctEmail, {
+      chatgpt_check_status: res.status,
+      chatgpt_checked_at: res.checked_at,
+      chatgpt_check_detail: res.detail,
+      chatgpt_token_expires_at: res.chatgpt_token_expires_at,
+    });
+  }
+
+  function cacheSession(acctEmail, session) {
+    const text = JSON.stringify(session, null, 2);
+    setSessionCache((prev) => ({ ...prev, [acctEmail]: text }));
+    setAccounts((prev) =>
+      prev.map((a) => (a.email === acctEmail
+        ? { ...a, chatgpt_session_json_len: JSON.stringify(session).length } : a)),
+    );
+    return text;
+  }
+
+  async function refreshChatGPTSession(acctEmail) {
+    setSessionBusy(acctEmail);
+    try {
+      const res = await api.chatgptSession(acctEmail);
+      applyChatGPTCheck(acctEmail, res);
+      if (res.session) {
+        cacheSession(acctEmail, res.session);
+        setSessionOpen(acctEmail);
+      }
+      if (res.fresh) toast.success("已获取最新 session");
+      else if (res.session) toast.warning(`刷新失败（${res.detail}），显示上次保存的 session`);
+      else toast.error(`获取 session 失败：${res.detail}`);
+    } catch (e) {
+      toast.error(`「${acctEmail}」获取 session 失败（${e.status || "?"}）`);
+    } finally {
+      setSessionBusy("");
+    }
+  }
+
+  async function savedSessionText(acctEmail) {
+    if (sessionCache[acctEmail]) return sessionCache[acctEmail];
+    setSessionBusy(acctEmail);
+    try {
+      const res = await api.chatgptSessionSaved(acctEmail);
+      if (!res.session) {
+        toast.error("没有保存的 session，请先点「获取最新」");
+        return "";
+      }
+      return cacheSession(acctEmail, res.session);
+    } catch (e) {
+      toast.error(`「${acctEmail}」读取 session 失败（${e.status || "?"}）`);
+      return "";
+    } finally {
+      setSessionBusy("");
+    }
+  }
+
+  async function toggleSession(acctEmail) {
+    if (sessionOpen === acctEmail) {
+      setSessionOpen("");
+      return;
+    }
+    if (await savedSessionText(acctEmail)) setSessionOpen(acctEmail);
+  }
+
+  async function copySession(acctEmail) {
+    const text = await savedSessionText(acctEmail);
+    if (text) copyText(text, `${acctEmail}:chatgpt_session_json`);
+  }
+
+  async function doCheckChatGPT(acctEmail) {
+    setCheckingChatGPT(acctEmail);
+    try {
+      const res = await api.checkChatGPT(acctEmail);
+      applyChatGPTCheck(acctEmail, res);
+      if (res.refreshed) refreshLists();
+    } catch (e) {
+      toast.error(`「${acctEmail}」ChatGPT 检测失败（${e.status || "?"}）`);
+    } finally {
+      setCheckingChatGPT("");
+    }
+  }
+
+  async function doResyncChatGPT(acctEmail) {
+    setCheckingChatGPT(acctEmail);
+    try {
+      const res = await api.chatgptResync(acctEmail);
+      if (res.mode === "synced") {
+        toast.success(`「${acctEmail}」已从 OKBrowser 窗口同步到有效的 ChatGPT 凭证`);
+        refreshLists();
+      } else {
+        attach(res.run_id);
+        toast.info(`${res.reason || "窗口里没有可用会话"}，已启动重新登录任务`);
+        navigate("register");
+      }
+    } catch (e) {
+      if (e?.status === 401) return;
+      toast.error(e.body?.detail || `「${acctEmail}」重新获取失败（${e.status || "?"}）`);
+    } finally {
+      setCheckingChatGPT("");
+    }
+  }
+
+  async function runBatchChatGPTCheck(emails) {
+    const queue = [...emails];
+    const stat = { done: 0, total: emails.length, alive: 0, dead: 0, other: 0 };
+    setBatchChatGPTCheck({ ...stat });
+    const worker = async () => {
+      while (queue.length) {
+        const email = queue.shift();
+        try {
+          const res = await api.checkChatGPT(email);
+          applyChatGPTCheck(email, res);
+          if (res.status === "alive") stat.alive += 1;
+          else if (res.status === "dead") stat.dead += 1;
+          else stat.other += 1;
+        } catch (e) {
+          if (e?.status === 401) return;
+          stat.other += 1;
+        }
+        stat.done += 1;
+        setBatchChatGPTCheck({ ...stat });
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    setBatchChatGPTCheck(null);
+    refreshLists();
+    const msg = `ChatGPT 检测完成：有效 ${stat.alive} 个，失效 ${stat.dead} 个`
+      + (stat.other ? `，其他/出错 ${stat.other} 个` : "");
+    if (stat.dead || stat.other) toast.error(msg);
+    else toast.success(msg);
+  }
 
   // 读取接管浏览器里的 sessionKey；新值会由后端检测后新建/更新账号。
   // manual=true 时是用户点按钮，结果都要提示；轮询时只在有新进展时提示。
@@ -258,37 +620,133 @@ export default function Accounts({ attach, running, navigate }) {
     }
   };
 
-  async function doRerun(acctEmail) {
+  async function doRerun(acctEmail, platform = "claude") {
     try {
-      const res = await api.rerun(acctEmail);
+      const res = await api.rerun(acctEmail, platform);
       attach(res.run_id);
-      toast.success("已开始重跑，正在跳转…");
+      toast.success("已启动注册任务，正在跳转…");
       navigate("register");
     } catch (err) {
       toast.error(
         err.status === 409
-          ? `「${acctEmail}」重跑失败：已有任务在运行`
-          : `「${acctEmail}」重跑失败`,
+          ? `「${acctEmail}」启动失败：已有任务在运行`
+          : `「${acctEmail}」启动失败`,
       );
     }
+  }
+
+  async function waitForRunFinish(runId) {
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      try {
+        const detail = await api.runDetail(runId);
+        if (detail && detail.status && detail.status !== "running") {
+          return detail;
+        }
+      } catch {
+        return { status: "failed" };
+      }
+    }
+  }
+
+  async function runBatchRegister(emails, platform = "claude") {
+    if (!emails.length) return;
+    stopBatchRegRef.current = false;
+    const stat = { done: 0, total: emails.length, ok: 0, failed: 0, current: "", platform };
+    setBatchReg({ ...stat });
+    for (const email of emails) {
+      if (stopBatchRegRef.current) break;
+      stat.current = email;
+      setBatchReg({ ...stat });
+      try {
+        const res = await api.rerun(email, platform);
+        attach(res.run_id);
+        await waitForRunFinish(res.run_id);
+        const list = await api.listAccounts().catch(() => null);
+        if (list) setAccounts(list);
+        const updated = (list || []).find((a) => a.email === email);
+        const ok = platform === "chatgpt"
+          ? updated && updated.chatgpt_last_run_id === res.run_id && hasChatGPT(updated)
+          : updated && updated.session_key;
+        if (ok) stat.ok += 1;
+        else stat.failed += 1;
+      } catch (err) {
+        stat.failed += 1;
+        if (err?.status === 409) {
+          toast.error("已有其他注册任务在运行，批量注册已中止");
+          break;
+        }
+      }
+      stat.done += 1;
+      setBatchReg({ ...stat });
+    }
+    const stopped = stopBatchRegRef.current;
+    setBatchReg(null);
+    refreshLists();
+    if (stopped) {
+      toast.info(`已停止后续排队：已完成 ${stat.done}/${stat.total}（成功 ${stat.ok}，未成功 ${stat.failed}）`);
+    } else if (stat.failed) {
+      toast.error(`批量注册完成：成功 ${stat.ok} 个，未成功 ${stat.failed} 个`);
+    } else {
+      toast.success(`批量注册完成：全部成功（${stat.ok} 个）`);
+    }
+  }
+
+  function applyCheckResult(acctEmail, res) {
+    setAccounts((list) =>
+      list.map((a) =>
+        a.email === acctEmail
+          ? {
+              ...a,
+              check_status: res.status,
+              checked_at: res.checked_at,
+              check_detail: res.detail,
+              org_uuid: res.org_uuid || a.org_uuid,
+            }
+          : a,
+      ),
+    );
   }
 
   async function doCheck(acctEmail) {
     setChecking(acctEmail);
     try {
-      const res = await api.checkAccount(acctEmail);
-      setAccounts((list) =>
-        list.map((a) =>
-          a.email === acctEmail
-            ? { ...a, check_status: res.status, checked_at: res.checked_at, check_detail: res.detail }
-            : a,
-        ),
-      );
+      applyCheckResult(acctEmail, await api.checkAccount(acctEmail));
     } catch (e) {
       toast.error(`「${acctEmail}」检测失败（${e.status || "?"}）`);
     } finally {
       setChecking("");
     }
+  }
+
+  // 批量检测：前端并发 3 路逐个调用单个检测接口，显示进度。
+  async function runBatchCheck(emails) {
+    const queue = [...emails];
+    const stat = { done: 0, total: emails.length, alive: 0, dead: 0, other: 0 };
+    setBatchCheck({ ...stat });
+    const worker = async () => {
+      while (queue.length) {
+        const email = queue.shift();
+        try {
+          const res = await api.checkAccount(email);
+          applyCheckResult(email, res);
+          if (res.status === "alive") stat.alive += 1;
+          else if (res.status === "dead") stat.dead += 1;
+          else stat.other += 1;
+        } catch (e) {
+          if (e?.status === 401) return;
+          stat.other += 1;
+        }
+        stat.done += 1;
+        setBatchCheck({ ...stat });
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    setBatchCheck(null);
+    const msg = `检测完成：有效 ${stat.alive} 个，失效 ${stat.dead} 个`
+      + (stat.other ? `，其他/出错 ${stat.other} 个` : "");
+    if (stat.dead || stat.other) toast.error(msg);
+    else toast.success(msg);
   }
 
   const setAuthorizingFlag = (email, on) =>
@@ -470,15 +928,25 @@ export default function Accounts({ attach, running, navigate }) {
 
   const confirmDelete = async () => {
     const emails = deleteTargets;
+    if (!emails.length) return;
+    const withWindows = deleteTargetWindows > 0 && deleteWindows;
     setDeleteTargets([]);
+    const windowNote = (res) =>
+      withWindows ? `，并删除 ${res.okbrowser_deleted || 0}/${deleteTargetWindows} 个 OKBrowser 窗口` : "";
     try {
       if (emails.length === 1) {
-        await api.accountDelete(emails[0]);
-        toast.success(`已删除 ${emails[0]}`);
+        const res = await api.accountDelete(emails[0], withWindows);
+        toast.success(`已删除 ${emails[0]}${windowNote(res)}`);
       } else {
-        const res = await api.accountsBatchDelete(emails);
-        toast.success(`已删除 ${res.deleted} 个账号`);
+        const res = await api.accountsBatchDelete(emails, withWindows);
+        if (!res.deleted) {
+          toast.error("没有删除任何账号（可能已不存在）");
+        } else {
+          toast.success(`已删除 ${res.deleted} 个账号${windowNote(res)}`);
+        }
       }
+      // 先本地去掉，避免等刷新时仍闪一下旧列表
+      setAccounts((list) => list.filter((a) => !emails.includes(a.email)));
       if (emails.includes(editingEmail)) setEditingEmail("");
       setSelected((prev) => {
         const next = new Set(prev);
@@ -512,7 +980,15 @@ export default function Accounts({ attach, running, navigate }) {
               <LogIn /> 手动登录…
             </Button>
             <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-              <Upload /> 导入 SK…
+              <Upload /> 导入 SK / 邮箱…
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              title="新建、重命名、删除分组"
+              onClick={() => setGroupManageOpen(true)}
+            >
+              <FolderCog /> 分组管理…
             </Button>
             {accounts.length > 0 && (
               <Button variant="outline" size="sm" onClick={() => setExportOpen(true)}>
@@ -577,13 +1053,26 @@ export default function Accounts({ attach, running, navigate }) {
                 <Input
                   className="pl-8"
                   value={query}
-                  placeholder="搜索邮箱 / 备注 / 代理 / sessionKey"
+                  placeholder="搜索邮箱 / 备注 / 代理 / 分组 / sessionKey"
                   spellCheck={false}
                   onChange={(e) => setQuery(e.target.value)}
                 />
               </div>
               <select
+                className="h-9 max-w-44 rounded-md border bg-background px-2 text-sm"
+                aria-label="按分组筛选"
+                value={groupFilter}
+                onChange={(e) => setGroupFilter(e.target.value)}
+              >
+                <option value={ALL_GROUPS}>全部分组</option>
+                <option value={UNGROUPED}>未分组（{groups.ungrouped_count}）</option>
+                {groups.groups.map((g) => (
+                  <option key={g.name} value={g.name}>{g.name}（{g.count}）</option>
+                ))}
+              </select>
+              <select
                 className="h-9 rounded-md border bg-background px-2 text-sm"
+                aria-label="按状态筛选"
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
               >
@@ -591,7 +1080,16 @@ export default function Accounts({ attach, running, navigate }) {
                   <option key={v} value={v}>{label}</option>
                 ))}
               </select>
-              <label className="flex h-9 cursor-pointer items-center gap-2 px-1 text-sm text-muted-foreground select-none">
+            </div>
+          )}
+          {accounts.length > 0 && (
+            <div
+              className={cn(
+                "flex min-h-11 flex-wrap items-center gap-2 rounded-lg border px-3 py-1.5",
+                selectedVisible.length > 0 ? "border-primary/40 bg-primary/5" : "border-dashed",
+              )}
+            >
+              <label className="flex cursor-pointer items-center gap-2 text-sm select-none">
                 <input
                   type="checkbox"
                   className="size-4 accent-primary"
@@ -599,38 +1097,152 @@ export default function Accounts({ attach, running, navigate }) {
                   disabled={visible.length === 0}
                   onChange={toggleSelectAll}
                 />
-                全选
+                {selectedVisible.length > 0 ? `已选 ${selectedVisible.length} 个` : "全选"}
               </label>
               <span className="text-xs text-muted-foreground">
                 {visible.length === accounts.length
                   ? `共 ${accounts.length} 个`
                   : `显示 ${visible.length} / ${accounts.length} 个`}
-                {selectedVisible.length > 0 ? `，已选 ${selectedVisible.length} 个` : ""}
               </span>
-              {selectedVisible.length > 0 && (
+              <span className="flex-1" />
+              {batchReg && (
                 <Button
                   variant="outline"
                   size="sm"
-                  disabled={!!batchOAuth || !selectedVisible.some((a) => a.session_key)}
-                  title="用 sessionKey 为所选账号获取 Claude OAuth 令牌（没有 sessionKey 的跳过）"
-                  onClick={() =>
-                    runBatchOAuth(selectedVisible.filter((a) => a.session_key).map((a) => a.email))
-                  }
+                  title={`当前：${batchReg.current}`}
+                  onClick={() => {
+                    stopBatchRegRef.current = true;
+                    toast.info("将在当前账号跑完后停止后续排队…");
+                  }}
                 >
-                  <KeyRound />
-                  {batchOAuth
-                    ? `授权中 ${batchOAuth.done}/${batchOAuth.total}…`
-                    : `获取 OAuth（${selectedVisible.filter((a) => a.session_key).length}）`}
+                  <Square />
+                  停止{batchReg.platform === "chatgpt" ? " ChatGPT " : ""}注册（{batchReg.done}/{batchReg.total}）
                 </Button>
               )}
+              {[
+                [batchCheck, "Claude 检测"],
+                [batchOAuth, "OAuth 授权"],
+                [batchChatGPTCheck, "ChatGPT 检测"],
+              ].map(([b, label]) =>
+                b ? (
+                  <span key={label} className="text-xs text-muted-foreground">
+                    {label}中 {b.done}/{b.total}…
+                  </span>
+                ) : null,
+              )}
               {selectedVisible.length > 0 && (
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  onClick={() => setDeleteTargets(selectedVisible.map((a) => a.email))}
-                >
-                  <Trash2 /> 删除所选（{selectedVisible.length}）
-                </Button>
+                <>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        Claude <ChevronDown />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        disabled={running || !!batchReg}
+                        onSelect={() => runBatchRegister(selectedVisible.map((a) => a.email))}
+                      >
+                        <Play /> 注册 / 重跑（{selectedVisible.length}）
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={!!batchCheck || !selectedSk.length}
+                        onSelect={() => runBatchCheck(selectedSk)}
+                      >
+                        <ShieldCheck /> 检测 sessionKey（{selectedSk.length}）
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={!!batchOAuth || !selectedSk.length}
+                        onSelect={() => runBatchOAuth(selectedSk)}
+                      >
+                        <KeyRound /> 获取 OAuth（{selectedSk.length}）
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        ChatGPT <ChevronDown />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        disabled={running || !!batchReg}
+                        onSelect={() =>
+                          runBatchRegister(selectedVisible.map((a) => a.email), "chatgpt")
+                        }
+                      >
+                        <MessageSquare /> 注册 / 重跑（{selectedVisible.length}）
+                      </DropdownMenuItem>
+                      <DropdownMenuItem
+                        disabled={!!batchChatGPTCheck || !selectedGpt.length}
+                        onSelect={() => runBatchChatGPTCheck(selectedGpt)}
+                      >
+                        <ShieldCheck /> 检测会话（{selectedGpt.length}）
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        <FolderInput /> 移动分组 <ChevronDown />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="max-w-64">
+                      {groups.groups.map((g) => (
+                        <DropdownMenuItem key={g.name} onSelect={() => onBatchGroupSelect(g.name)}>
+                          <span className="truncate">{g.name}</span>
+                        </DropdownMenuItem>
+                      ))}
+                      {groups.groups.length > 0 && <DropdownMenuSeparator />}
+                      <DropdownMenuItem onSelect={() => onBatchGroupSelect("__new__")}>
+                        <Plus /> 新分组…
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => onBatchGroupSelect(UNGROUPED)}>
+                        移出分组
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        <Server /> 修改代理 <ChevronDown />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" className="max-w-72">
+                      {savedProxies.length > 0 ? (
+                        savedProxies.map((p) => (
+                          <DropdownMenuItem
+                            key={p.id}
+                            title={p.url}
+                            onSelect={() => onBatchProxySelect({ proxy_id: p.id }, p.name)}
+                          >
+                            <span className="truncate">{p.name}</span>
+                          </DropdownMenuItem>
+                        ))
+                      ) : (
+                        <DropdownMenuItem onSelect={() => navigate?.("proxies")}>
+                          去代理池添加代理…
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={() => onBatchProxySelect("__custom__")}>
+                        <Plus /> 自定义代理…
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => onBatchProxySelect({ proxy: "" }, "")}>
+                        清除代理（直连）
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="text-red-400 hover:text-red-300"
+                    onClick={() => setDeleteTargets(selectedVisible.map((a) => a.email))}
+                  >
+                    <Trash2 /> 删除
+                  </Button>
+                </>
               )}
             </div>
           )}
@@ -659,7 +1271,19 @@ export default function Accounts({ attach, running, navigate }) {
                         {a.email}
                       </span>
                       <span className="flex items-center gap-2 overflow-hidden whitespace-nowrap text-xs text-muted-foreground">
-                        <StatusBadge status={a.status} />
+                        {a.group_name ? (
+                          <Badge
+                            className="max-w-32 truncate rounded-full border-transparent bg-sky-500/15 text-sky-400"
+                            title={`分组：${a.group_name}`}
+                          >
+                            {a.group_name}
+                          </Badge>
+                        ) : null}
+                        <PlatformStatusBadge
+                          platform="Claude"
+                          status={a.status === "pending" ? "" : a.status}
+                          title={a.status ? "" : "尚未用此邮箱注册 Claude"}
+                        />
                         <LiveBadge
                           status={a.check_status}
                           checkedAt={a.checked_at}
@@ -675,14 +1299,35 @@ export default function Accounts({ attach, running, navigate }) {
                           </Badge>
                         ) : null}
                         <OAuthBadge acct={a} />
+                        <ChatGPTBadge acct={a} />
+                        {a.okbrowser_window_id ? (
+                          <Badge
+                            variant="outline"
+                            className="rounded-full px-1.5 font-mono text-[11px]"
+                            title="已绑定的 OKBrowser 指纹浏览器窗口"
+                          >
+                            OKB #{a.okbrowser_window_id}
+                          </Badge>
+                        ) : null}
                         {a.display_name ? <span>{a.display_name}</span> : null}
                         {a.session_key ? (
                           <span className="font-mono">
                             sk {String(a.session_key).slice(7, 17)}…
                           </span>
                         ) : null}
+                        {a.mail_base_url === "outlook" ? (
+                          <Badge variant="outline" className="rounded-full px-1.5 text-[11px]">Outlook</Badge>
+                        ) : null}
                         {a.proxy ? (
-                          <Badge variant="outline" className="rounded-full px-1.5 text-[11px]">代理</Badge>
+                          <Badge
+                            variant="outline"
+                            className="max-w-36 truncate rounded-full px-1.5 text-[11px]"
+                            title={`代理：${a.proxy}`}
+                          >
+                            {proxyNameByUrl.get(a.proxy)
+                              ? `代理 · ${proxyNameByUrl.get(a.proxy)}`
+                              : "代理"}
+                          </Badge>
                         ) : null}
                       </span>
                     </span>
@@ -700,47 +1345,107 @@ export default function Accounts({ attach, running, navigate }) {
                       >
                         {editingEmail === a.email ? "收起" : "编辑"}
                       </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="outline" size="sm">
+                            {checking === a.email
+                              ? "检测中…"
+                              : authorizing.has(a.email)
+                                ? "授权中…"
+                                : "Claude"}
+                            <ChevronDown />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            disabled={running || !!batchReg}
+                            onSelect={() => doRerun(a.email)}
+                          >
+                            <Play /> {!a.status || a.status === "pending" ? "注册" : "重跑注册"}
+                          </DropdownMenuItem>
+                          {a.session_key && (
+                            <>
+                              <DropdownMenuItem
+                                disabled={checking === a.email}
+                                onSelect={() => doCheck(a.email)}
+                              >
+                                <ShieldCheck /> 检测 sessionKey
+                              </DropdownMenuItem>
+                              <DropdownMenuItem
+                                disabled={authorizing.has(a.email)}
+                                onSelect={() => runOAuth(a.email)}
+                              >
+                                <KeyRound /> {a.access_token ? "重新授权 OAuth" : "获取 OAuth"}
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                className="text-blue-400"
+                                onSelect={() => startTakeover(a.email)}
+                              >
+                                <MonitorPlay /> 接管浏览器
+                              </DropdownMenuItem>
+                            </>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="outline" size="sm">
+                            {checkingChatGPT === a.email ? "检测中…" : "ChatGPT"}
+                            <ChevronDown />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuLabel>复用此邮箱、代理与窗口</DropdownMenuLabel>
+                          <DropdownMenuItem
+                            disabled={running || !!batchReg}
+                            onSelect={() => doRerun(a.email, "chatgpt")}
+                          >
+                            <MessageSquare />
+                            {a.chatgpt_status === "success" ? "重跑注册" : "注册 ChatGPT"}
+                          </DropdownMenuItem>
+                          {hasChatGPT(a) && (
+                            <DropdownMenuItem
+                              disabled={checkingChatGPT === a.email}
+                              onSelect={() => doCheckChatGPT(a.email)}
+                            >
+                              <ShieldCheck /> 检测会话
+                            </DropdownMenuItem>
+                          )}
+                          {a.chatgpt_status && (
+                            <DropdownMenuItem
+                              disabled={checkingChatGPT === a.email || running || !!batchReg}
+                              title="先从绑定的 OKBrowser 窗口同步当前会话，窗口里没有可用会话时自动重新登录"
+                              onSelect={() => doResyncChatGPT(a.email)}
+                            >
+                              <RefreshCw /> 重新获取凭证
+                            </DropdownMenuItem>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => doRerun(a.email)}
-                        disabled={running}
+                        title="查询邮件"
+                        aria-label={`查询 ${a.email} 的邮件`}
+                        onClick={() => setMailEmail(a.email)}
                       >
-                        重跑
+                        <Mail />
                       </Button>
-                      {a.session_key && (
+                      {(okbMode || a.okbrowser_window_id) && (
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => doCheck(a.email)}
-                          disabled={checking === a.email}
+                          title={
+                            a.okbrowser_window_id
+                              ? `打开 OKBrowser 窗口 #${a.okbrowser_window_id}`
+                              : "新建并绑定一个 OKBrowser 窗口"
+                          }
+                          aria-label={`打开 ${a.email} 的 OKBrowser 窗口`}
+                          onClick={() => openWindow(a)}
+                          disabled={okbBusy === a.email}
                         >
-                          {checking === a.email ? "检测中…" : "检测"}
-                        </Button>
-                      )}
-                      {a.session_key && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          title="用 sessionKey 自动完成 Claude OAuth 授权，获取 access_token / refresh_token"
-                          onClick={() => runOAuth(a.email)}
-                          disabled={authorizing.has(a.email)}
-                        >
-                          {authorizing.has(a.email)
-                            ? "授权中…"
-                            : a.access_token
-                              ? "重新授权"
-                              : "OAuth"}
-                        </Button>
-                      )}
-                      {a.session_key && (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="border-blue-500/50 text-blue-400 hover:text-blue-300"
-                          onClick={() => startTakeover(a.email)}
-                        >
-                          接管
+                          <ExternalLink />
                         </Button>
                       )}
                       <Button
@@ -762,7 +1467,123 @@ export default function Accounts({ attach, running, navigate }) {
                         setForm={setEditForm}
                         disabled={saving}
                         idPrefix={`edit-${a.email}`}
+                        groups={groups.groups.map((g) => g.name)}
+                        proxies={savedProxies}
                       />
+                      {hasChatGPT(a) && (
+                        <div className="flex flex-col gap-1.5 rounded-md border bg-muted/30 p-2.5 text-xs">
+                          <div className="text-muted-foreground">
+                            ChatGPT 凭据 · accessToken 过期 {a.chatgpt_token_expires_at || "未知"}
+                            {a.chatgpt_checked_at ? ` · 检测于 ${a.chatgpt_checked_at}` : ""}
+                          </div>
+                          {CHATGPT_COPY_FIELDS.filter(([k]) => a[k]).map(([k, label]) => (
+                            <div key={k} className="flex items-center gap-2">
+                              <span className="w-24 shrink-0 text-muted-foreground">{label}</span>
+                              <span className="min-w-0 flex-1 truncate font-mono">
+                                {k.endsWith("_token") ? `${String(a[k]).slice(0, 18)}…` : a[k]}
+                              </span>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2"
+                                onClick={() => copyText(String(a[k]), `${a.email}:${k}`)}
+                              >
+                                {copiedEmail === `${a.email}:${k}` ? "已复制" : "复制"}
+                              </Button>
+                            </div>
+                          ))}
+                          <div className="flex items-center gap-2">
+                            <span className="w-24 shrink-0 text-muted-foreground">Session JSON</span>
+                            <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                              {a.chatgpt_session_json_len
+                                ? `/api/auth/session · ${a.chatgpt_session_json_len} 字符`
+                                : "尚未获取"}
+                            </span>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 px-2"
+                              disabled={sessionBusy === a.email}
+                              title="用 sessionToken 重新请求 /api/auth/session 并保存"
+                              onClick={() => refreshChatGPTSession(a.email)}
+                            >
+                              {sessionBusy === a.email ? "获取中…" : "获取最新"}
+                            </Button>
+                            {a.chatgpt_session_json_len > 0 && (
+                              <>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 px-2"
+                                  disabled={sessionBusy === a.email}
+                                  onClick={() => toggleSession(a.email)}
+                                >
+                                  {sessionOpen === a.email ? "收起" : "查看"}
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 px-2"
+                                  disabled={sessionBusy === a.email}
+                                  onClick={() => copySession(a.email)}
+                                >
+                                  {copiedEmail === `${a.email}:chatgpt_session_json` ? "已复制" : "复制"}
+                                </Button>
+                              </>
+                            )}
+                          </div>
+                          {sessionOpen === a.email && sessionCache[a.email] && (
+                            <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded border bg-background/60 p-2 font-mono text-[11px] leading-relaxed">
+                              {sessionCache[a.email]}
+                            </pre>
+                          )}
+                        </div>
+                      )}
+                      {a.okbrowser_window_id && (
+                        <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/30 p-2.5 text-xs">
+                          <span className="text-muted-foreground">
+                            OKBrowser 窗口 <span className="font-mono">#{a.okbrowser_window_id}</span>
+                          </span>
+                          <span className="flex-1" />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2"
+                            disabled={okbBusy === a.email}
+                            onClick={() => openWindow(a)}
+                          >
+                            打开
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2"
+                            disabled={okbBusy === a.email}
+                            onClick={() => closeWindow(a)}
+                          >
+                            关闭
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2"
+                            title="只清除绑定，不删除 OKBrowser 里的窗口"
+                            disabled={okbBusy === a.email}
+                            onClick={() => removeWindow(a, true)}
+                          >
+                            解绑
+                          </Button>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-red-400 hover:text-red-300"
+                            disabled={okbBusy === a.email}
+                            onClick={() => removeWindow(a, false)}
+                          >
+                            删除窗口
+                          </Button>
+                        </div>
+                      )}
                       {a.access_token && (
                         <div className="flex flex-col gap-1.5 rounded-md border bg-muted/30 p-2.5 text-xs">
                           <div className="flex items-center justify-between text-muted-foreground">
@@ -830,6 +1651,17 @@ export default function Accounts({ attach, running, navigate }) {
                 : `确认删除所选的 ${deleteTargets.length} 个账号？此操作不可恢复。`}
             </AlertDialogDescription>
           </AlertDialogHeader>
+          {deleteTargetWindows > 0 && (
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="size-4 accent-primary"
+                checked={deleteWindows}
+                onChange={(e) => setDeleteWindows(e.target.checked)}
+              />
+              同时删除关联的 OKBrowser 指纹浏览器窗口（{deleteTargetWindows} 个）
+            </label>
+          )}
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction
@@ -841,14 +1673,36 @@ export default function Accounts({ attach, running, navigate }) {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      <ExportDialog open={exportOpen} onOpenChange={setExportOpen} />
-      <AccountCreateDialog open={createOpen} onOpenChange={setCreateOpen} onCreated={refreshLists} />
+      <ExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        selectedEmails={selectedVisible.map((a) => a.email)}
+      />
+      <AccountCreateDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreated={refreshLists}
+        groups={groups.groups.map((g) => g.name)}
+        proxies={savedProxies}
+      />
+      <GroupManageDialog
+        open={groupManageOpen}
+        onOpenChange={setGroupManageOpen}
+        groups={groups}
+        onChanged={refreshLists}
+      />
+      <MailDialog email={mailEmail} onOpenChange={(o) => !o && setMailEmail("")} />
       <ManualLoginDialog
         open={manualOpen}
         onOpenChange={setManualOpen}
         onStarted={() => api.takeoverStatus().then(setTakeover).catch(() => {})}
       />
-      <ImportDialog open={importOpen} onOpenChange={setImportOpen} onImported={refreshLists} />
+      <ImportDialog
+        open={importOpen}
+        onOpenChange={setImportOpen}
+        onImported={refreshLists}
+        groups={groups.groups.map((g) => g.name)}
+      />
     </>
   );
 }

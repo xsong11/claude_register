@@ -89,6 +89,11 @@ else:
 | `email` | string | 指定要注册的邮箱；不填则自动创建临时邮箱 |
 | `domain` | string | 自动创建邮箱时使用的域名；不填用服务默认域名 |
 | `proxy_id` | string | 使用代理池中的某个代理（id 见 `GET /api/v1/proxies`）；不填用服务默认代理 |
+| `platform` | string | `claude`（默认）/ `chatgpt` / `both`（同一邮箱先注册 Claude，再复用邮箱、代理与 OKBrowser 窗口注册 ChatGPT） |
+| `group_name` | string | 注册产出的账号归入该分组（最长 64 字符） |
+
+同一个邮箱的 Claude 与 ChatGPT 共用一条账号记录：ChatGPT 凭据在 `chatgpt_*` 字段里，
+不会覆盖 Claude 的 `session_key` 等字段。
 
 响应：
 
@@ -127,10 +132,14 @@ else:
 | 值 | 含义 | 附带内容 |
 |---|---|---|
 | `running` | 仍在进行 | `account` 为 `null` |
-| `success` | 注册成功并拿到 sessionKey | `account`（及 `export`） |
-| `needs_manual` | 流程跑完但没拿到 sessionKey；账号已入库，需管理员在面板「接管」处理 | `account`、`log_tail` |
+| `success` | 注册成功并拿到凭据（Claude 为 sessionKey，ChatGPT 为 sessionToken / accessToken） | `account`（及 `export`） |
+| `needs_manual` | 流程跑完但没拿到凭据；账号已入库，需管理员在面板处理 | `account`、`log_tail` |
+| `phone_required` | 平台要求手机号验证（多半是代理 IP 被风控），换代理重跑 | `account`、`log_tail` |
+| `banned` | ChatGPT 登录时 OpenAI 提示账号已被封禁（`account_deactivated`） | `account`、`log_tail` |
 | `failed` | 注册失败 | `account` 为 `null`，`log_tail` 为最近 20 行日志 |
 
+- 响应带 `platform`；含 ChatGPT 时另有 `chatgpt_status`，`platform=both` 时另有 `claude_status`，
+  两个平台都成功 `status` 才是 `success`。
 - `export` 仅在 `format` 不是 `json` 且有账号时出现。
 - `404`：`run_id` 不存在；`400`：`fields` / `format` / `sep` 不合法；`422`：`wait` 超出范围。
 
@@ -147,6 +156,8 @@ else:
 | `check_status` | 不筛选 | 最近一次存活检测结果：`alive` / `dead` / `blocked` / `error` |
 | `emails` | 不筛选 | 逗号分隔的邮箱列表（不区分大小写） |
 | `claimed` | 不筛选 | `true` 只导出已获取的账号，`false` 只导出未获取的 |
+| `group` | 不筛选 | 只导出该分组的账号；`__ungrouped__` 表示仅未分组 |
+| `platform` | 不筛选 | `claude` 只要有 sessionKey 的；`chatgpt` 只要有 ChatGPT 凭据的，且 `status` / `check_status` / `claimed` 改按 ChatGPT 侧判断 |
 
 - 批量导出**不会**打「已获取」标记；需要逐个发放账号时请用 `POST /api/v1/accounts/claim`。
 - 响应体为对应格式的内容；响应头 `X-Total-Count` 为导出条数。
@@ -178,6 +189,8 @@ curl -H "Authorization: Bearer $KEY" \
 | `format` | `json` | 设为 `text` / `csv` / `line` 时，额外返回 `export` 文本 |
 | `sep` | `----` | `format=line` 时的分隔符 |
 | `check_status` | 不筛选 | 只获取该检测结果的账号，如 `alive`（只发最近检测有效的） |
+| `group` | 不筛选 | 只获取该分组的账号；`__ungrouped__` 表示仅未分组 |
+| `platform` | `claude` | `chatgpt` 时领取 ChatGPT 注册成功、有 sessionToken / accessToken 的账号；两个平台各有独立的「已获取」标记 |
 
 响应 `200`：
 

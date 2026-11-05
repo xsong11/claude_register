@@ -24,6 +24,7 @@ class AccountRecord:
     mailbox_id: str = ""
     mail_key: str = ""       # AnyMail 子 key 明文(仅 emails:read、锁定本邮箱);降级为空
     mail_base_url: str = ""  # 子 key 对应的 AnyMail 服务地址,分享账号时一并给出
+    okbrowser_window_id: str = ""  # 保留下来的 OKBrowser 指纹窗口;删除或未用 OKBrowser 时为空
     saved_at: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -39,6 +40,8 @@ class AccountRecord:
             "mail_base_url": self.mail_base_url or "",
             "saved_at": self.saved_at or "",
         }
+        if self.okbrowser_window_id:
+            data["okbrowser_window_id"] = self.okbrowser_window_id
         if self.extra:
             data["extra"] = self.extra
         return data

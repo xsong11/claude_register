@@ -12,7 +12,7 @@ import re
 import secrets
 import string
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -96,18 +96,36 @@ class AnyMailAccessError(RuntimeError):
         super().__init__(f"AnyMail 接码失败 {status_code}: {detail}\n{hint}。")
 
 
+_HTML_DROP_RE = re.compile(r"<(style|script|head)\b.*?</\1\s*>|<!--.*?-->", re.IGNORECASE | re.DOTALL)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def html_to_text(html: str) -> str:
+    text = _HTML_DROP_RE.sub(" ", html or "")
+    text = _HTML_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
 def extract_code(email: dict[str, Any], regex: str) -> str | None:
     """在 subject / text_body / html_body 里找验证码。
 
+    HTML 先去标签再匹配：纯 HTML 邮件里关键词与验证码之间常隔着带数字的样式
+    （如 OpenAI 的 padding: 28px），原样匹配会被 [^\\d#] 截断。
     有捕获组返回第 1 组，否则返回整段匹配（与 AnyMail 服务端行为一致）。
     """
     try:
         pattern = re.compile(regex, re.IGNORECASE)
     except re.error:
         return None
-    for field in ("subject", "text_body", "html_body"):
-        value = email.get(field) or ""
-        match = pattern.search(str(value))
+    html = str(email.get("html_body") or "")
+    candidates = (
+        str(email.get("subject") or ""),
+        str(email.get("text_body") or ""),
+        html_to_text(html) if html else "",
+        html,
+    )
+    for value in candidates:
+        match = pattern.search(value)
         if match:
             return match.group(1) if match.groups() else match.group(0)
     return None
@@ -421,10 +439,13 @@ class AnyMailClient:
         fallback_regex: str | None = None,
         timeout: float = 120.0,
         interval: float = 3.0,
+        exclude: Collection[str] = (),
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> str | None:
         """轮询直到取到验证码；超时返回 None（调用方走降级路径）。
+
+        exclude：已用过的码，跳过（同一邮箱短时间内连收两封验证码时用）。
 
         两级匹配在单次响应内完成：先用服务端提取的 code，没有再用兜底正则
         匹配同一批邮件的正文——避免每轮翻倍请求。
@@ -453,11 +474,11 @@ class AnyMailClient:
 
             for email in emails:
                 code = email.get("code")
-                if code:
+                if code and str(code) not in exclude:
                     return str(code)
             for email in emails:
                 code = extract_code(email, fallback)
-                if code:
+                if code and code not in exclude:
                     log("服务端未提取到码，已用兜底正则命中。")
                     return code
 

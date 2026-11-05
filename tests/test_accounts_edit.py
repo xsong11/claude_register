@@ -151,3 +151,59 @@ def test_edit_requires_auth(tmp_path):
     assert c.request("DELETE", "/api/accounts/a@x.com").status_code == 401
     assert c.post("/api/accounts", json={"email": "n@x.com"}).status_code == 401
     assert c.post("/api/accounts/batch-delete", json={"emails": ["a@x.com"]}).status_code == 401
+
+
+def test_list_accounts_empty_after_delete_ignores_success_runs(tmp_path):
+    """删光 accounts 后，不能再用成功的 runs 拼出幽灵账号。"""
+    app, c = _client(tmp_path)
+    conn = app.state.cr.conn
+    db.create_run(conn, "ghost@x.com", "x.com", "", "2026-07-31T00:00:00Z")
+    db.finish_run(conn, 1, "success", "2026-07-31T00:01:00Z")
+    assert c.request("DELETE", "/api/accounts/a@x.com").status_code == 200
+    assert c.get("/api/accounts").json() == []
+    r = c.post("/api/accounts/batch-delete", json={"emails": ["ghost@x.com"]})
+    assert r.status_code == 200 and r.json()["deleted"] == 0
+
+
+def test_export_post_selected_emails(tmp_path):
+    app, c = _client(tmp_path)
+    conn = app.state.cr.conn
+    db.upsert_account(conn, "b@x.com", "x.com", "", "", None, "success", session_key="sk-b")
+    r = c.post("/api/accounts/export",
+               json={"format": "line", "fields": "email,session_key", "emails": ["b@x.com"]})
+    assert r.status_code == 200
+    assert r.text == "b@x.com----sk-b\n"
+    assert r.headers["cache-control"] == "no-store"
+    assert c.post("/api/accounts/export", json={"emails": []}).status_code == 400
+    assert c.post("/api/accounts/export", json={"emails": "b@x.com"}).status_code == 400
+    # 删除后不再导出
+    c.request("DELETE", "/api/accounts/b@x.com")
+    r = c.post("/api/accounts/export", json={"format": "line", "fields": "email"})
+    assert r.text == "a@x.com\n"
+
+
+def test_rerun_deleted_account_404(tmp_path):
+    _, c = _client(tmp_path)
+    assert c.post("/api/accounts/gone@x.com/rerun").status_code == 404
+
+
+def test_runner_does_not_resurrect_account_deleted_during_run(tmp_path):
+    import time
+
+    from server import runner
+    from server.config_store import Config
+
+    conn = db.init_db(tmp_path / "t.db")
+    db.upsert_account(conn, "d@x.com", "x.com", "", "", None, "pending")
+
+    def fake_flow(*, email=None, domain=None, config=None, **kw):
+        db.delete_account(conn, "d@x.com")  # 用户在注册途中删掉了它
+        return {"email": email, "sessionKey": "sk-new"}
+
+    r = runner.Runner(conn, tmp_path, lambda: "2026-10-26T00:00:00Z")
+    rid = r.start(Config(), email="d@x.com", flow_fn=fake_flow)
+    for _ in range(50):
+        if db.get_run(conn, rid)["status"] != "running":
+            break
+        time.sleep(0.02)
+    assert db.get_account(conn, "d@x.com") is None

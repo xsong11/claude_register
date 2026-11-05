@@ -38,23 +38,25 @@ const buttonVariants = cva(
   }
 )
 
-function Button({
+// React 18 不会把 ref 当普通 prop 传递；Radix 的 Trigger(asChild) 需要拿到按钮 DOM 做定位
+const Button = React.forwardRef(function Button({
   className,
   variant = "default",
   size = "default",
   asChild = false,
   ...props
-}) {
+}, ref) {
   const Comp = asChild ? Slot.Root : "button"
 
   return (
     <Comp
+      ref={ref}
       data-slot="button"
       data-variant={variant}
       data-size={size}
       className={cn(buttonVariants({ variant, size, className }))}
       {...props} />
   );
-}
+})
 
 export { Button, buttonVariants }

@@ -36,6 +36,9 @@ class RegisterRequest(BaseModel):
                               examples=["alice@example.com"])
     domain: str | None = Field(None, description="自动创建邮箱时使用的域名；不填用默认域名")
     proxy_id: str | None = Field(None, description="代理池中的代理 id（见 GET /api/v1/proxies）")
+    platform: Literal["claude", "chatgpt", "both"] | None = Field(
+        None, description="注册平台：claude（默认）/ chatgpt / both（同一邮箱先 Claude 再 ChatGPT）")
+    group_name: str | None = Field(None, description="注册产出的账号归入的分组", examples=["主力号"])
 
 
 class RegisterAccepted(BaseModel):
@@ -50,9 +53,15 @@ class RegisterBusy(BaseModel):
 
 class RegisterResult(BaseModel):
     run_id: int
-    status: Literal["running", "success", "needs_manual", "failed"] = Field(
-        description="running 进行中；success 成功并拿到 sessionKey；"
-                    "needs_manual 跑完但没拿到 sessionKey（账号已入库）；failed 失败")
+    status: Literal["running", "success", "needs_manual", "phone_required", "banned",
+                    "failed"] = Field(
+        description="running 进行中；success 成功并拿到凭据；"
+                    "needs_manual 跑完但没拿到凭据（账号已入库）；phone_required 需手机号验证；"
+                    "banned ChatGPT 账号已被封禁；"
+                    "failed 失败。platform=both 时两个平台都成功才是 success")
+    platform: Literal["claude", "chatgpt", "both"] = Field(description="本次注册的平台")
+    claude_status: str | None = Field(None, description="platform=both 时 Claude 侧的结果")
+    chatgpt_status: str | None = Field(None, description="platform 含 chatgpt 时 ChatGPT 侧的结果")
     email: str | None = Field(description="注册的邮箱（开始后才确定）")
     started_at: str | None
     finished_at: str | None
@@ -126,35 +135,71 @@ _AUTH_ERRORS = {
 }
 _FIELDS_DESC = ("逗号分隔的字段名，默认 email,session_key,proxy,mail_base_url,mail_key；"
                 "可选值见 GET /api/v1/fields")
+_GROUP_DESC = f"只要该分组的账号；{export.UNGROUPED} 表示仅未分组；不填不筛选"
+_PLATFORM_DESC = ("claude 只要有 sessionKey 的账号；chatgpt 只要有 ChatGPT 凭据的账号，"
+                  "且 status / check_status / claimed 改按 ChatGPT 侧判断；不填不筛选")
 
 
 def run_result(state, run_id: int, fields, fmt: str, sep: str) -> dict | None:
     """把 runs 行 + 账号行整理成对外的结果；run 不存在返回 None。
 
-    status 取值：running / success / needs_manual / failed。
+    status 取值：running / success / needs_manual / phone_required / failed。
     needs_manual 表示流程跑完但没拿到 sessionKey（账号已入库，需在面板接管处理）。
+    phone_required 表示 Claude 要求手机号验证（多半是代理 IP 被风控，换代理重跑）。
     """
     row = db.get_run(state.conn, run_id)
     if row is None:
         return None
+    platform = row.get("platform") or "claude"
     status = row["status"] or "failed"
     acct = None
-    if status == "success":
+    side: dict[str, str] = {}
+    if status not in ("running", "failed"):
         acct = db.get_account(state.conn, row["email"]) if row.get("email") else None
-        status = "success" if acct and acct.get("session_key") else "needs_manual"
+        if platform in ("claude", "both"):
+            side["claude"] = _claude_status(acct)
+        if platform in ("chatgpt", "both"):
+            side["chatgpt"] = _chatgpt_status(acct, run_id)
+        bad = [s for s in side.values() if s != "success"]
+        status = bad[0] if bad else "success"
     result = {
         "run_id": row["id"],
         "status": status,
+        "platform": platform,
         "email": row.get("email") or None,
         "started_at": row.get("started_at") or None,
         "finished_at": row.get("finished_at") or None,
         "account": export.pick(acct, fields) if acct else None,
     }
+    if platform == "both" and "claude" in side:
+        result["claude_status"] = side["claude"]
+    if "chatgpt" in side:
+        result["chatgpt_status"] = side["chatgpt"]
     if acct and fmt != "json":
         result["export"] = export.render([acct], fields, fmt, sep=sep)[0]
-    if status in ("failed", "needs_manual"):
+    if status in ("failed", "needs_manual", "phone_required", "banned"):
         result["log_tail"] = _log_tail(row.get("output_dir"))
     return result
+
+
+def _claude_status(acct: dict | None) -> str:
+    if acct and acct.get("session_key"):
+        return "success"
+    if acct and acct.get("status") == "phone_required":
+        return "phone_required"
+    return "needs_manual"
+
+
+def _chatgpt_status(acct: dict | None, run_id: int) -> str:
+    if not acct or acct.get("chatgpt_last_run_id") != run_id:
+        return "needs_manual"
+    if acct.get("chatgpt_status") == "banned":
+        return "banned"
+    if acct.get("chatgpt_session_token") or acct.get("chatgpt_access_token"):
+        return "success"
+    if acct.get("chatgpt_status") == "phone_required":
+        return "phone_required"
+    return "needs_manual"
 
 
 def _log_tail(output_dir) -> list[str]:
@@ -172,22 +217,24 @@ def _split(raw: str | None) -> list[str]:
 
 
 def export_response(rows, *, fields, fmt, sep, emails, status, check_status,
-                    download: bool, claimed=None) -> Response:
+                    download: bool, claimed=None, group=None, platform=None) -> Response:
     try:
         keys = export.parse_fields(fields)
         fmt = export.parse_format(fmt)
         sep = export.parse_sep(sep)
         claimed_filter = export.parse_claimed(claimed)
+        platform = export.parse_platform(platform)
     except export.ExportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     picked = export.filter_rows(
         rows, emails=_split(emails), status=status or None,
         check_status=check_status or None, claimed=claimed_filter,
+        group=group or None, platform=platform,
     )
     if fmt == "sub2api":  # sub2api 只导入已授权的账号
         picked = [r for r in picked if r.get("access_token")]
     body, media = export.render(picked, keys, fmt, sep=sep)
-    headers = {"X-Total-Count": str(len(picked))}
+    headers = {"X-Total-Count": str(len(picked)), "Cache-Control": "no-store"}
     if download:
         headers["Content-Disposition"] = (
             f'attachment; filename="accounts.{export.FILE_EXT[fmt]}"'
@@ -246,7 +293,7 @@ def register_open_api(app: FastAPI, state, *, start_registration, account_rows) 
             raise HTTPException(status_code=400, detail="请求体必须是 JSON") from None
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
-        for key in ("email", "domain", "proxy_id"):
+        for key in ("email", "domain", "proxy_id", "platform", "group_name"):
             if body.get(key) is not None and not isinstance(body[key], str):
                 raise HTTPException(status_code=400, detail=f"{key} 必须是字符串")
         try:
@@ -325,12 +372,16 @@ def register_open_api(app: FastAPI, state, *, start_registration, account_rows) 
         claimed: str | None = Query(
             None, description="true 只导出已获取的账号，false 只导出未获取的；不填不筛选",
             json_schema_extra={"enum": ["true", "false"]}),
+        group: str | None = Query(None, description=_GROUP_DESC),
+        platform: str | None = Query(None, description=_PLATFORM_DESC,
+                                     json_schema_extra={"enum": list(export.PLATFORMS)}),
         _=Depends(require_api_key),
     ):
         """按创建时间倒序导出已入库账号，可选字段、格式与筛选条件。不会打「已获取」标记。"""
         return export_response(
             account_rows(), fields=fields, fmt=format, sep=sep, emails=emails,
             status=status, check_status=check_status, download=False, claimed=claimed,
+            group=group, platform=platform,
         )
 
     @app.post(
@@ -349,28 +400,35 @@ def register_open_api(app: FastAPI, state, *, start_registration, account_rows) 
         sep: str | None = Query(None, description="format=line 的分隔符，默认 ----"),
         check_status: str | None = Query(
             None, description="只领取该检测结果的账号（如 alive）；不填时跳过 dead / blocked"),
+        group: str | None = Query(None, description=_GROUP_DESC),
+        platform: str | None = Query(
+            None, description="claude（默认）领取有 sessionKey 的；chatgpt 领取有 ChatGPT 凭据的，"
+                              "两个平台的「已获取」标记互不影响",
+            json_schema_extra={"enum": list(export.PLATFORMS)}),
         _=Depends(require_api_key),
     ):
-        """每调用一次领取一个「注册成功、有 sessionKey、未获取过」的账号（先入库先发），
+        """每调用一次领取一个「注册成功、有凭据、未获取过」的账号（先入库先发），
         并立即打上「已获取」标记，同一账号不会被重复领取。"""
         try:
             keys = export.parse_fields(fields)
             fmt = export.parse_format(format)
             line_sep = export.parse_sep(sep)
+            plat = export.parse_platform(platform) or "claude"
         except export.ExportError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from None
         if check_status is not None and check_status not in CHECK_STATUSES:
             raise HTTPException(
                 status_code=400,
                 detail=f"check_status 只能是 {' / '.join(CHECK_STATUSES)}")
-        acct = db.claim_account(state.conn, state.now_fn(), check_status=check_status or None)
+        opts = {"check_status": check_status or None, "platform": plat, "group": group or None}
+        acct = db.claim_account(state.conn, state.now_fn(), **opts)
         if acct is None:
             raise HTTPException(status_code=404, detail="没有可获取的账号")
         result = {
             "email": acct["email"],
-            "claimed_at": acct["claimed_at"],
+            "claimed_at": acct["chatgpt_claimed_at" if plat == "chatgpt" else "claimed_at"],
             "account": export.pick(acct, keys),
-            "remaining": db.count_claimable(state.conn, check_status=check_status or None),
+            "remaining": db.count_claimable(state.conn, **opts),
         }
         if fmt != "json":
             result["export"] = export.render([acct], keys, fmt, sep=line_sep)[0]

@@ -13,10 +13,11 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 CONFIG_PATH = ROOT / "config.yaml"
 
-app = create_app(data_dir=DATA_DIR, config_path=CONFIG_PATH)
-
 
 def main() -> None:
+    # 不能在导入时创建：create_app 会把库里所有 running 的运行标成 failed，
+    # 测试或脚本 import serve 时会误伤正在运行的面板。
+    app = create_app(data_dir=DATA_DIR, config_path=CONFIG_PATH)
     cfg = load_config(CONFIG_PATH)
     if not cfg.panel_password:
         print("⚠️  未设置面板密码：仅开放配置接口（/api/config），其余接口全部 401。"

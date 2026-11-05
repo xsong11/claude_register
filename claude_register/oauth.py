@@ -23,7 +23,11 @@ from dataclasses import asdict, dataclass
 from urllib.parse import parse_qs, urlsplit
 
 from claude_register.browser import mask_proxy, normalize_proxy_url
-from claude_register.session_check import _default_client, _looks_like_shield
+from claude_register.session_check import (
+    _default_client,
+    _looks_like_shield,
+    org_uuid_from_payload,
+)
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
@@ -106,17 +110,13 @@ def _http_error(step: str, resp) -> OAuthError:
 
 def pick_org_uuid(payload) -> str:
     """多个组织时优先 raven_type == "team"，否则取第一个（与 sub2api 相同）。"""
-    if isinstance(payload, dict):
-        payload = payload.get("organizations")
-    if not isinstance(payload, list):
+    items = payload.get("organizations") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
         raise OAuthError("获取组织：响应不是组织列表")
-    orgs = [o for o in payload if isinstance(o, dict) and o.get("uuid")]
-    if not orgs:
+    org_uuid = org_uuid_from_payload(items)
+    if not org_uuid:
         raise OAuthError("获取组织：账号下没有组织")
-    for org in orgs:
-        if org.get("raven_type") == "team":
-            return str(org["uuid"])
-    return str(orgs[0]["uuid"])
+    return org_uuid
 
 
 def _claude_headers() -> dict:

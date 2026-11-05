@@ -37,7 +37,16 @@ class Config:
     # sub2api 对接：用于把重新授权得到的 OAuth 令牌写回 sub2api 的账号。
     sub2api_base_url: str = ""
     sub2api_admin_key: str = ""
+    # 注册用的浏览器："chromium"（内置）或 "okbrowser"（OKBrowser 指纹浏览器本地 API）。
+    browser_mode: str = "chromium"
+    okbrowser_api_url: str = "http://localhost:30396"
+    okbrowser_group_id: str = ""
+    okbrowser_delete_after: bool = True
+    # 预设分组：让还没有账号的新分组也能出现在下拉框里。
+    account_groups: tuple = ()
 
+
+BROWSER_MODES = ("chromium", "okbrowser")
 
 _NODE_KEYS = ("name", "base_url", "username", "password", "proxy_host")
 
@@ -61,7 +70,14 @@ def load_config(path: Path) -> Config:
     api = raw.get("api", {}) or {}
     oa = raw.get("oauth", {}) or {}
     s2 = raw.get("sub2api", {}) or {}
+    br = raw.get("browser", {}) or {}
+    ok = br.get("okbrowser", {}) or {}
+    mode = str(br.get("mode", "chromium") or "chromium")
     return Config(
+        browser_mode=mode if mode in BROWSER_MODES else "chromium",
+        okbrowser_api_url=str(ok.get("api_url", "") or "http://localhost:30396"),
+        okbrowser_group_id=str(ok.get("group_id", "") or ""),
+        okbrowser_delete_after=bool(ok.get("delete_after", True)),
         panel_password=str(panel.get("password", "") or ""),
         panel_port=int(panel.get("port", 8790)),
         anymail_api_key=str(anymail.get("api_key", "") or ""),
@@ -85,7 +101,20 @@ def load_config(path: Path) -> Config:
         oauth_auto_after_register=bool(oa.get("auto_after_register", False)),
         sub2api_base_url=str(s2.get("base_url", "") or ""),
         sub2api_admin_key=str(s2.get("admin_key", "") or ""),
+        account_groups=_clean_groups(raw.get("account_groups") or []),
     )
+
+
+def _clean_groups(raw) -> tuple:
+    """去空白、去空、去重（保持顺序）；非列表按空处理。"""
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()[:64]
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
 
 
 _FIELD_MAP = {
@@ -106,6 +135,13 @@ _FIELD_MAP = {
     "oauth_auto_after_register": ("oauth", "auto_after_register"),
     "sub2api_base_url": ("sub2api", "base_url"),
     "sub2api_admin_key": ("sub2api", "admin_key"),
+    "browser_mode": ("browser", "mode"),
+}
+
+_OKBROWSER_KEYS = {
+    "okbrowser_api_url": "api_url",
+    "okbrowser_group_id": "group_id",
+    "okbrowser_delete_after": "delete_after",
 }
 
 
@@ -121,9 +157,22 @@ def save_config(path: Path, updates: dict) -> Config:
     for k in ("xui_enabled", "xui_expiry_days", "xui_port_min", "xui_port_max"):
         if k in clean:
             xui_scalar[k] = clean.pop(k)
+    if "browser_mode" in clean and clean["browser_mode"] not in BROWSER_MODES:
+        raise ValueError(f"浏览器模式只能是：{', '.join(BROWSER_MODES)}")
+    okb = {k: clean.pop(k) for k in list(clean) if k in _OKBROWSER_KEYS}
+    if "okbrowser_api_url" in okb:
+        okb["okbrowser_api_url"] = str(okb["okbrowser_api_url"] or "").strip() \
+            or "http://localhost:30396"
+    if "okbrowser_group_id" in okb:
+        okb["okbrowser_group_id"] = str(okb["okbrowser_group_id"] or "").strip()
+    if "okbrowser_delete_after" in okb:
+        okb["okbrowser_delete_after"] = bool(okb["okbrowser_delete_after"])
+    cfg = replace(cfg, **okb)
     incoming_proxies = clean.pop("saved_proxies", None)
     if "saved_proxies" in updates:
         cfg = replace(cfg, saved_proxies=validate_saved_proxies(incoming_proxies))
+    if "account_groups" in clean:
+        cfg = replace(cfg, account_groups=_clean_groups(clean.pop("account_groups")))
     incoming_nodes = clean.pop("xui_nodes", None)
     cfg = replace(cfg, **{k: v for k, v in clean.items() if k in _FIELD_MAP})
     cfg = replace(cfg, **xui_scalar)
@@ -137,9 +186,10 @@ def save_config(path: Path, updates: dict) -> Config:
             merged.append(node)
         cfg = replace(cfg, xui_nodes=tuple(merged))
     out: dict = {"panel": {}, "anymail": {}, "register": {}, "xui": {}, "takeover": {}, "api": {},
-                 "oauth": {}, "sub2api": {}}
+                 "oauth": {}, "sub2api": {}, "browser": {}}
     for field, (section, key) in _FIELD_MAP.items():
         out[section][key] = getattr(cfg, field)
+    out["browser"]["okbrowser"] = {k: getattr(cfg, f) for f, k in _OKBROWSER_KEYS.items()}
     out["register"]["proxies"] = [dict(p) for p in cfg.saved_proxies]
     out["xui"] = {
         "enabled": cfg.xui_enabled,
@@ -147,6 +197,7 @@ def save_config(path: Path, updates: dict) -> Config:
         "port_range": [cfg.xui_port_min, cfg.xui_port_max],
         "nodes": [dict(n) for n in cfg.xui_nodes],
     }
+    out["account_groups"] = list(cfg.account_groups)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(yaml.safe_dump(out, allow_unicode=True, sort_keys=False),
                           encoding="utf-8")
@@ -163,6 +214,9 @@ def to_dict(cfg: Config) -> dict:
     d["xui_port_min"] = cfg.xui_port_min
     d["xui_port_max"] = cfg.xui_port_max
     d["xui_nodes"] = [dict(n) for n in cfg.xui_nodes]
+    for f in _OKBROWSER_KEYS:
+        d[f] = getattr(cfg, f)
+    d["account_groups"] = list(cfg.account_groups)
     return d
 
 

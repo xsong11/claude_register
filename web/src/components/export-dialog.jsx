@@ -23,6 +23,7 @@ const FORMATS = [
   ["csv", "CSV（Excel 可打开）"],
   ["json", "JSON"],
   ["sub2api", "sub2api 导入文件（仅已授权 OAuth 的账号）"],
+  ["outlook", "Outlook 原格式 + sk（仅 Outlook 账号）"],
 ];
 
 const SCOPES = [
@@ -33,7 +34,7 @@ const SCOPES = [
   ["claimed", "仅已获取", { claimed: "true" }],
 ];
 
-const EXT = { text: "txt", line: "txt", csv: "csv", json: "json", sub2api: "json" };
+const EXT = { text: "txt", line: "txt", csv: "csv", json: "json", sub2api: "json", outlook: "txt" };
 
 function isEmptyExport(text, format) {
   const body = text.replace(/^\ufeff/, "").trim();
@@ -56,13 +57,21 @@ function loadSaved() {
   }
 }
 
-export function ExportDialog({ open, onOpenChange }) {
+export function ExportDialog({ open, onOpenChange, selectedEmails = [] }) {
   const [meta, setMeta] = useState(null);
   const [fields, setFields] = useState([]);
   const [format, setFormat] = useState("text");
   const [sep, setSep] = useState("----");
   const [scope, setScope] = useState("all");
   const [busy, setBusy] = useState(false);
+  const selectedCount = selectedEmails.length;
+
+  // 每次打开：有勾选默认导出所选，没勾选时不能停在「所选账号」
+  useEffect(() => {
+    if (!open) return;
+    if (selectedCount > 0) setScope("selected");
+    else setScope((s) => (s === "selected" ? loadSaved()?.scope || "all" : s));
+  }, [open, selectedCount]);
 
   useEffect(() => {
     if (!open || meta) return;
@@ -76,7 +85,9 @@ export function ExportDialog({ open, onOpenChange }) {
         setFields(savedFields.length ? savedFields : d.default_fields);
         if (saved?.format && EXT[saved.format]) setFormat(saved.format);
         if (saved?.sep) setSep(saved.sep);
-        if (saved?.scope && SCOPES.some(([k]) => k === saved.scope)) setScope(saved.scope);
+        if (!selectedCount && saved?.scope && SCOPES.some(([k]) => k === saved.scope)) {
+          setScope(saved.scope);
+        }
       })
       .catch((e) => {
         if (e?.status !== 401) toast.error("加载导出字段失败");
@@ -94,16 +105,23 @@ export function ExportDialog({ open, onOpenChange }) {
 
   async function doExport() {
     const sub2api = format === "sub2api";
-    if (!sub2api && !fields.length) return toast.error("至少选择一个字段");
-    if (format === "line" && !sep) return toast.error("请填写分隔符");
+    const outlook = format === "outlook";
+    const usesSep = format === "line" || outlook;
+    if (!sub2api && !outlook && !fields.length) return toast.error("至少选择一个字段");
+    if (usesSep && !sep) return toast.error("请填写分隔符");
     setBusy(true);
     try {
-      const params = { format, ...SCOPES.find(([k]) => k === scope)[2] };
-      if (!sub2api) params.fields = fields.join(",");
-      if (format === "line") params.sep = sep;
+      const params =
+        scope === "selected"
+          ? { format, emails: selectedEmails }
+          : { format, ...(SCOPES.find(([k]) => k === scope) || SCOPES[0])[2] };
+      if (!sub2api && !outlook) params.fields = fields.join(",");
+      if (usesSep) params.sep = sep;
       const text = await api.exportAccountsText(params);
       if (isEmptyExport(text, format)) {
-        toast.error(sub2api ? "没有已授权 OAuth 的账号" : "没有符合条件的账号");
+        toast.error(
+          sub2api ? "没有已授权 OAuth 的账号" : outlook ? "没有符合条件的 Outlook 账号" : "没有符合条件的账号",
+        );
         return;
       }
       const type = { json: "application/json", sub2api: "application/json", csv: "text/csv" }[format]
@@ -114,7 +132,8 @@ export function ExportDialog({ open, onOpenChange }) {
       a.download = sub2api ? "sub2api-accounts.json" : `accounts.${EXT[format]}`;
       a.click();
       URL.revokeObjectURL(url);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ fields, format, sep, scope }));
+      const savedScope = scope === "selected" ? loadSaved()?.scope || "all" : scope;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ fields, format, sep, scope: savedScope }));
       onOpenChange(false);
     } catch (e) {
       if (e?.status !== 401) toast.error("导出失败，请重试");
@@ -139,6 +158,11 @@ export function ExportDialog({ open, onOpenChange }) {
                 生成 sub2api 的「导入数据」文件（Anthropic · OAuth 账号，含账号绑定的代理），
                 只包含已获取 OAuth 令牌的账号。导入后由 sub2api 自行刷新令牌；refresh_token
                 只能使用一次，同一份令牌不要同时导入多个系统。
+              </div>
+            ) : format === "outlook" ? (
+              <div className="rounded-md border bg-muted/30 p-2.5 text-xs text-muted-foreground">
+                每行一个 Outlook 账号：邮箱{sep}密码{sep}client_id{sep}refresh_token{sep}sk。
+                非 Outlook 账号会被跳过；未注册成功的账号 sk 为空，可在「范围」里选「仅注册成功」。
               </div>
             ) : (
             <div className="space-y-2">
@@ -187,11 +211,12 @@ export function ExportDialog({ open, onOpenChange }) {
                   value={scope}
                   onChange={(e) => setScope(e.target.value)}
                 >
+                  {selectedCount > 0 && <option value="selected">所选账号（{selectedCount}）</option>}
                   {SCOPES.map(([k, label]) => <option key={k} value={k}>{label}</option>)}
                 </select>
               </div>
             </div>
-            {format === "line" && (
+            {(format === "line" || format === "outlook") && (
               <div className="space-y-1.5">
                 <Label htmlFor="export-sep">分隔符</Label>
                 <Input id="export-sep" value={sep} maxLength={16} onChange={(e) => setSep(e.target.value)} />

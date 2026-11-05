@@ -41,11 +41,82 @@ export const api = {
       body: JSON.stringify(body),
     }).then(j),
 
-  startRun: (email, domain, proxyId) =>
+  startRun: (email, domain, proxyId, platform, groupName) =>
     fetch("/api/runs", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ email, domain, proxy_id: proxyId }),
+      body: JSON.stringify({
+        email, domain, proxy_id: proxyId, platform, group_name: groupName || undefined,
+      }),
+    }).then(j),
+
+  listGroups: () => fetch("/api/groups").then(j),
+
+  createGroup: (name) =>
+    fetch("/api/groups", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name }),
+    }).then(j),
+
+  renameGroup: (name, newName) =>
+    fetch(`/api/groups/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ new_name: newName }),
+    }).then(j),
+
+  deleteGroup: (name) =>
+    fetch(`/api/groups/${encodeURIComponent(name)}`, { method: "DELETE" }).then(j),
+
+  accountsBatchGroup: (emails, groupName) =>
+    fetch("/api/accounts/batch-group", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emails, group_name: groupName }),
+    }).then(j),
+
+  accountsBatchProxy: (emails, body) =>
+    fetch("/api/accounts/batch-proxy", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ emails, ...body }),
+    }).then(j),
+
+  okbrowserStart: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/okbrowser/start`, {
+      method: "POST",
+    }).then(j),
+
+  okbrowserClose: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/okbrowser/close`, {
+      method: "POST",
+    }).then(j),
+
+  okbrowserDelete: (email, unbindOnly) =>
+    fetch(
+      `/api/accounts/${encodeURIComponent(email)}/okbrowser${unbindOnly ? "?unbind_only=true" : ""}`,
+      { method: "DELETE" },
+    ).then(j),
+
+  checkChatGPT: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/check-chatgpt`, {
+      method: "POST",
+    }).then(j),
+  chatgptResync: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/chatgpt-resync`, {
+      method: "POST",
+    }).then(j),
+  chatgptSession: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/chatgpt-session`, {
+      method: "POST",
+    }).then(j),
+  chatgptSessionSaved: (email) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/chatgpt-session`).then(j),
+
+  accountMails: (email, limit) =>
+    fetch(`/api/accounts/${encodeURIComponent(email)}/mails?limit=${limit || 20}`, {
+      cache: "no-store",
     }).then(j),
 
   listRuns: () => fetch("/api/runs").then(j),
@@ -62,7 +133,12 @@ export const api = {
     }).then(j),
 
   exportAccountsText: (params) =>
-    fetch(`/api/accounts/export${params ? `?${new URLSearchParams(params)}` : ""}`).then((r) => {
+    fetch("/api/accounts/export", {
+      method: "POST",
+      cache: "no-store",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(params || {}),
+    }).then((r) => {
       if (!r.ok) {
         if (r.status === 401) window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT));
         const err = new Error(`http ${r.status}`);
@@ -83,11 +159,11 @@ export const api = {
       body: JSON.stringify(fields),
     }).then(j),
 
-  accountsBatchDelete: (emails) =>
+  accountsBatchDelete: (emails, deleteOkbrowser) =>
     fetch("/api/accounts/batch-delete", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ emails }),
+      body: JSON.stringify({ emails, delete_okbrowser: !!deleteOkbrowser }),
     }).then(j),
 
   accountUpdate: (email, fields) =>
@@ -97,14 +173,17 @@ export const api = {
       body: JSON.stringify(fields),
     }).then(j),
 
-  accountDelete: (email) =>
-    fetch(`/api/accounts/${encodeURIComponent(email)}`, {
-      method: "DELETE",
-    }).then(j),
+  accountDelete: (email, deleteOkbrowser) =>
+    fetch(
+      `/api/accounts/${encodeURIComponent(email)}${deleteOkbrowser ? "?delete_okbrowser=true" : ""}`,
+      { method: "DELETE" },
+    ).then(j),
 
-  rerun: (email) =>
+  rerun: (email, platform) =>
     fetch(`/api/accounts/${encodeURIComponent(email)}/rerun`, {
       method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: platform || "claude" }),
     }).then(j),
 
   setAccountClaimed: (email, claimed) =>
@@ -131,6 +210,41 @@ export const api = {
       method: "POST",
     }).then(j),
 
+  openaiKeys: () => fetch("/api/openai/keys").then(j),
+
+  openaiKeyCreate: (body) =>
+    fetch("/api/openai/keys", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(j),
+
+  openaiKeyUpdate: (id, body) =>
+    fetch(`/api/openai/keys/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(j),
+
+  openaiKeyDelete: (id) => fetch(`/api/openai/keys/${id}`, { method: "DELETE" }).then(j),
+
+  openaiKeyRefresh: (id) => fetch(`/api/openai/keys/${id}/refresh`, { method: "POST" }).then(j),
+
+  openaiProjectKeys: (id) => fetch(`/api/openai/keys/${id}/api-keys`).then(j),
+
+  openaiProjectKeyCreate: (id, projectId, name) =>
+    fetch(`/api/openai/keys/${id}/api-keys`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, name }),
+    }).then(j),
+
+  openaiProjectKeyDelete: (id, projectId, keyId) =>
+    fetch(
+      `/api/openai/keys/${id}/api-keys/${encodeURIComponent(keyId)}?project_id=${encodeURIComponent(projectId)}`,
+      { method: "DELETE" },
+    ).then(j),
+
   xuiTest: (node) =>
     fetch("/api/xui/test", {
       method: "POST",
@@ -140,6 +254,13 @@ export const api = {
 
   xuiCleanup: () =>
     fetch("/api/xui/cleanup", { method: "POST" }).then(j),
+
+  proxyTest: (body) =>
+    fetch("/api/proxies/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(j),
 
   takeoverStart: (email) =>
     fetch("/api/takeover/start", {
